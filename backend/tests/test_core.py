@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 from app.core.money import format_amount, format_usd, to_units
-from app.core.normalize import parse_item_code, parse_money, parse_quantity
-from app.core.reader import UnsupportedWorkbook, read_workbook
+from app.core.normalize import parse_item_code, parse_money, parse_quantity, parse_text
+from app.core.reader import SourceCell, SourceLine, UnsupportedWorkbook, read_workbook
 from app.core.rules import analyze
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -156,3 +156,54 @@ def test_money_is_exact_across_many_lines():
 def test_unsupported_file_gets_a_clear_error():
     with pytest.raises(UnsupportedWorkbook, match="Excel workbook"):
         read_workbook(b"not a spreadsheet")
+
+
+# ---------- duplicates vs conflicts ----------
+
+def make_line(line_id, row, code, size, qty, cost, retail="10.00",
+              description="Tee", category=None):
+    """A SourceLine built by hand, so a grouping rule can be tested on its own."""
+    fields = {"item_code": code, "description": description, "size": size,
+              "category": category, "quantity": qty, "unit_cost": cost, "retail": retail}
+    return SourceLine(
+        line_id=line_id, source_row=row,
+        item_code=parse_text(code), description=parse_text(description),
+        size=parse_text(size), category=parse_text(category),
+        quantity=parse_quantity(qty), unit_cost=parse_money(cost),
+        retail=parse_money(retail),
+        cells={n: SourceCell(f"A{row}", v) for n, v in fields.items()},
+    )
+
+
+def test_differing_text_is_a_duplicate_not_a_conflict():
+    """A different description changes no number, so it cannot promote a
+    duplicate to a conflict. It is named in the message instead."""
+    a = by_id(analyze([
+        make_line("R2", 2, "A100", "M", 10, "3.00", description="Cotton Tee"),
+        make_line("R3", 3, "A100", "M", 10, "3.00", description="Cotton T-Shirt"),
+    ]))
+    assert "DUPLICATE_KEPT" in codes(a["R2"]) and a["R2"].default_included
+    assert "DUPLICATE_ROW" in codes(a["R3"]) and not a["R3"].default_included
+    kept = next(i for i in a["R2"].issues if i.code == "DUPLICATE_KEPT")
+    assert "Cotton Tee vs Cotton T-Shirt" in kept.message
+
+
+def test_differing_numbers_are_a_conflict():
+    a = by_id(analyze([
+        make_line("R2", 2, "A100", "M", 10, "3.00"),
+        make_line("R3", 3, "A100", "M", 10, "3.50"),
+    ]))
+    for line_id in ("R2", "R3"):
+        assert "CONFLICTING_ROWS" in codes(a[line_id])
+        assert not a[line_id].default_included
+    message = next(i for i in a["R2"].issues if i.code == "CONFLICTING_ROWS").message
+    assert "cost $3.00 vs $3.50" in message
+
+
+def test_an_exact_duplicate_still_reads_as_identical():
+    a = by_id(analyze([
+        make_line("R2", 2, "A100", "M", 10, "3.00"),
+        make_line("R3", 3, "A100", "M", 10, "3.00"),
+    ]))
+    kept = next(i for i in a["R2"].issues if i.code == "DUPLICATE_KEPT")
+    assert kept.message == "Identical to row(s) 3. Counted once here."

@@ -126,19 +126,27 @@ def _line_issues(line: SourceLine) -> list[Issue]:
     return issues
 
 
+_NUMBER_FIELDS = (("quantity", "pieces"), ("unit_cost", "cost"), ("retail", "retail"))
+_TEXT_FIELDS = (("description", "description"), ("category", "category"))
+
+
 def _signature(line: SourceLine) -> tuple:
+    """What must match for two rows to be the same lot.
+
+    Quantity, cost and retail only. A differing description or category is
+    text, not meaning, so it never promotes a duplicate to a conflict; it is
+    named in the duplicate message instead.
+    """
     return (
-        line.description.value, line.category.value,
         line.quantity.status, line.quantity.value,
         line.unit_cost.status, line.unit_cost.value,
         line.retail.status, line.retail.value,
     )
 
 
-def _differences(lines: list[SourceLine]) -> str:
+def _differences(lines: list[SourceLine], fields: tuple[tuple[str, str], ...]) -> str:
     parts: list[str] = []
-    for name, label in (("quantity", "pieces"), ("unit_cost", "cost"), ("retail", "retail"),
-                        ("description", "description"), ("category", "category")):
+    for name, label in fields:
         shown: list[str] = []
         for ln in lines:
             p = getattr(ln, name)
@@ -153,7 +161,7 @@ def _differences(lines: list[SourceLine]) -> str:
             shown.append(text)
         if len(set(shown)) > 1:
             parts.append(f"{label} {' vs '.join(shown)}")
-    return "; ".join(parts) or "values"
+    return "; ".join(parts)
 
 
 def analyze(lines: list[SourceLine]) -> list[Analysis]:
@@ -174,22 +182,34 @@ def analyze(lines: list[SourceLine]) -> list[Analysis]:
 
         if len({_signature(m) for m in members}) == 1:
             first, *copies = members
-            results[first.line_id].issues.append(Issue(
-                "DUPLICATE_KEPT", "warning",
-                f"Identical to row(s) {', '.join(str(c.source_row) for c in copies)}. Counted once here.",
-            ))
-            for c in copies:
-                results[c.line_id].issues.append(Issue(
-                    "DUPLICATE_ROW", "needs_decision",
+            copy_rows = ", ".join(str(c.source_row) for c in copies)
+            text_diff = _differences(members, _TEXT_FIELDS)
+            if text_diff:
+                kept_msg = (
+                    f"Same pieces, cost and retail as row(s) {copy_rows}, so counted once here. "
+                    f"Only the text differs: {text_diff}."
+                )
+                copy_msg = (
+                    f"Same pieces, cost and retail as row {first.source_row} ({code}, {size}); "
+                    f"only the text differs ({text_diff}). Left out so stock isn't counted twice. "
+                    "Include only if the supplier really has two separate lots."
+                )
+            else:
+                kept_msg = f"Identical to row(s) {copy_rows}. Counted once here."
+                copy_msg = (
                     f"Identical to row {first.source_row} ({code}, {size}). Left out so stock isn't "
-                    "counted twice. Include only if the supplier really has two separate lots.",
-                ))
+                    "counted twice. Include only if the supplier really has two separate lots."
+                )
+            results[first.line_id].issues.append(Issue("DUPLICATE_KEPT", "warning", kept_msg))
+            for c in copies:
+                results[c.line_id].issues.append(Issue("DUPLICATE_ROW", "needs_decision", copy_msg))
         else:
+            differences = _differences(members, _NUMBER_FIELDS + _TEXT_FIELDS) or "values"
             for m in members:
                 results[m.line_id].issues.append(Issue(
                     "CONFLICTING_ROWS", "needs_decision",
                     f"{code} ({size}) appears on rows {rows} with different values: "
-                    f"{_differences(members)}. Choose which to keep.",
+                    f"{differences}. Choose which to keep.",
                 ))
         for m in members:
             results[m.line_id].related_line_ids = [i for i in ids if i != m.line_id]
