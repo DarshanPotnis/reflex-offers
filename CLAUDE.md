@@ -49,9 +49,14 @@ never promote a duplicate to a conflict.
 
 ## Current state (verified — do not regress)
 
-`backend/app/core/` is done and covered by `backend/tests/test_core.py` and
-`backend/tests/test_evaluate.py` (89 passing tests). Run
-`cd backend && python -m pytest -q` before and after every change.
+`backend/app/core/` and the whole backend API are done, covered by
+`test_core.py`, `test_evaluate.py` and `test_api.py` (141 passing, 6 skipped
+— the skips are the threaded race tests, which only mean anything on
+Postgres). Run `cd backend && python -m pytest -q` before and after every
+change.
+
+SQLAlchemy is pinned at **2.0.54**, not 2.0.36: the older pin cannot resolve
+`Mapped[str | None]` on Python 3.14 and fails at import.
 
 - `money.py` — all money is `int` ten-thousandths of a dollar ("units").
   $4.50 == 45_000. Never use float for money anywhere, including JSON and
@@ -70,6 +75,8 @@ never promote a duplicate to a conflict.
   returns the `Decision` to store); `evaluate()` -> effective lines +
   summary, including the `DUPLICATE_AFTER_EDIT` re-check.
 - `export.py` — `export_rows()` / `to_csv()` from evaluated lines only.
+- `db.py`/`models.py`/`service.py`/`api.py`/`main.py` — storage and HTTP.
+  Every transaction boundary is in `service.py`; `api.py` only translates.
 
 ### Answer key (default policy, no user decisions)
 
@@ -95,7 +102,8 @@ backend/   FastAPI, SQLAlchemy 2, Postgres (prod) / SQLite (dev, tests)
   app/core/        pure logic, no I/O (done: money, normalize, reader, rules)
   app/core/evaluate.py   done: lines + decisions -> effective lines + summary
   app/core/export.py     done: CSV rows from evaluated lines
-  app/db.py, app/models.py, app/service.py, app/api.py, app/main.py
+  app/db.py, app/models.py, app/service.py, app/api.py, app/main.py  (done)
+    service.py is the only module that commits; api.py computes nothing
 frontend/  React + TypeScript + Vite, served by FastAPI as static files
 ```
 
@@ -136,10 +144,15 @@ Warning only, never a block — two real lots are possible.
   `note`, `updated_at`. **Upserted**, never appended — saving the same
   decision twice cannot double anything.
 - `save_requests`: pk (`offer_id`, `request_id`), `receipt` (json),
-  `body_sha256`, `created_at`. Idempotency for saves. The receipt is small —
-  `{offer_id, version, applied}` — never the full offer: the 5,000-row offer
-  serialises to ~3.2 MB, so storing it per click would bloat the database and
-  hand back stale lines on retry. The client re-GETs after a save.
+  `body_sha256`, `created_at`. Idempotency for saves. The receipt is minimal
+  — `{offer_id, request_id, version, applied}` — never the full offer and not
+  the summary either: the client re-fetches after every save, so totals and
+  lines always arrive in the same response and cannot disagree. (The 5,000-row
+  offer serialises to ~3.2 MB; Phase 4 measures that refetch and optimises it
+  then, with a measurement rather than a guess.) `body_sha256` is over the
+  **canonical JSON** of the parsed payload — sorted keys, normalised — not the
+  raw bytes, so a client that re-serialises an identical retry isn't accused
+  of changing it.
 
 ## API contract
 
@@ -158,7 +171,8 @@ All money in JSON is a **string** decimal (`"4.50"`). Pydantic models use
 - `POST /api/offers/{id}/decisions` — body
   `{request_id: uuid, base_version: int, changes: [{line_id, action: include|exclude|reset, item_code?, size?, quantity?, unit_cost?, note?}]}`.
   Empty `changes` -> 422; a save that changes nothing is a client bug, not a
-  version bump. In ONE transaction:
+  version bump. Two changes for the same `line_id` in one batch -> 422; last
+  write wins would be silent and order-dependent. Then:
   1. `request_id` already stored -> if `body_sha256` matches, return the
      stored receipt unchanged (retry-safe); if it differs -> 422
      "request_id reused with different changes". This check runs **before**
@@ -166,16 +180,25 @@ All money in JSON is a **string** decimal (`"4.50"`). Pydantic models use
      version has moved on, because its own earlier commit is what moved it.
   2. Bump with a conditional update:
      `UPDATE offers SET version = version + 1 WHERE id = :id AND version = :base`.
-     `rowcount == 0` -> 409 `{current_version}`, nothing written. Read-then-write
-     loses updates under Postgres READ COMMITTED, and doing it first also locks
-     the offer row for the rest of the transaction. SQLite serialises writers,
-     so tests alone would never expose this.
-  3. Validate every change (below). Any failure -> 422 listing each error by
+     Read-then-write loses updates under Postgres READ COMMITTED, and doing the
+     bump first also locks the offer row for the rest of the transaction.
+     SQLite serialises writers, so tests alone would never expose this.
+  3. `rowcount == 0` -> **re-check `save_requests` for this `request_id`
+     before concluding anything.** Two copies of one retry can both miss
+     step 1; only one wins the conditional update, and the loser must not be
+     told 409 for work its own twin just committed. Roll back, read
+     `save_requests` afresh, then: receipt with a matching hash -> 200 with
+     that receipt; receipt with a different hash -> 422; no receipt -> 409
+     `{current_version}`, nothing written.
+  4. Validate every change (below). Any failure -> 422 listing each error by
      line_id, nothing written (the rollback undoes the bump too — atomic).
-  4. Upsert decisions (`reset` deletes), store the receipt under
-     `request_id`, commit. A concurrent retry of the same `request_id` will
-     hit the `save_requests` primary key: catch `IntegrityError`, roll back,
-     and return the stored receipt.
+  5. Replace decisions for the touched lines (delete, then insert; `reset` is
+     the delete alone — portable across SQLite and Postgres, and atomic inside
+     the transaction), store the receipt under `request_id`, commit. If two
+     retries still collide on the `save_requests` primary key, catch
+     `IntegrityError`, roll back, and return the stored receipt.
+
+  Only the referenced `line_id`s are loaded for validation, never all 5,000.
 - `GET /api/offers/{id}/export.csv` — from saved state.
 - `GET /api/offers/{id}/source` — original uploaded file.
 
@@ -204,6 +227,13 @@ layer and an explicit type check inside `validate_change`. Pydantic's default
 lax mode accepts `"12"` -> 12, `true` -> 1 and `12.0` -> 12, none of which is
 an integer a supplier typed. The rule must hold even if a future endpoint
 forgets the strict annotation.
+
+Every 422 from this endpoint uses one shape,
+`{"errors": [{"line_id": ..., "messages": [...]}]}`. Pydantic rejects a
+`StrictInt` violation before any handler runs, so a `RequestValidationError`
+handler maps its `loc` (`("body", "changes", 2, "quantity")`) back to that
+change's `line_id` and re-emits it in that shape. One contract, whichever
+layer caught the problem.
 
 These rules must hold even when the UI is bypassed — there is a required test
 for exactly that.
@@ -240,6 +270,11 @@ sum of `quantity` == summary pieces.
   the cleaned value, its issues, and actions: include (editable code / size /
   pieces / cost), exclude, reset. Conflict groups are shown together with
   "keep this one".
+- **"Keep this one"** on a conflict or duplicate group sends ONE save holding
+  `include` for the chosen line and `exclude` for every sibling in
+  `related_line_ids`, so the whole group resolves in a single version bump.
+  Resolving a group must never leave a sibling sitting in Needs decision —
+  including row 14 of an A108 conflict has to close row 15 in the same save.
 - Edits are staged locally. A bar shows "N unsaved changes · Save". States:
   saving; saved (vN); **failed -> "Not saved. Your changes are still here. Retry"**
   (retry reuses the same `request_id`; a new id is generated only after a
@@ -288,6 +323,13 @@ commissions, deal management, new file formats, AI-based parsing of values.
 
 - Python 3.14 (local and Docker), type hints, small pure functions in `app/core`. No I/O in core.
 - New behaviour gets a test first or alongside. Keep `test_core.py` green.
+- Tests run on SQLite by default and against Postgres with
+  `TEST_DATABASE_URL=postgresql+psycopg://...`. The version race only exists
+  on Postgres, so the race tests mean little until they run there.
+- **`conftest.py` refuses any database whose name lacks "test".** The
+  fixtures drop every table; pointing them at a real database would be
+  unrecoverable. SQLite connects with `timeout=30` so the threaded tests wait
+  for the write lock instead of failing with "database is locked".
 - Prefer creating new files over large rewrites of working ones.
 - Brute-force-simple first; optimize only with a measurement showing why.
 - Explain architecture before implementing anything non-trivial, then build.
