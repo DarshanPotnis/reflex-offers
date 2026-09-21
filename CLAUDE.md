@@ -202,7 +202,7 @@ commissions, deal management, new file formats, AI-based parsing of values.
 
 ## Conventions
 
-- Python 3.12, type hints, small pure functions in `app/core`. No I/O in core.
+- Python 3.14 (local and Docker), type hints, small pure functions in `app/core`. No I/O in core.
 - New behaviour gets a test first or alongside. Keep `test_core.py` green.
 - Prefer creating new files over large rewrites of working ones.
 - Brute-force-simple first; optimize only with a measurement showing why.
