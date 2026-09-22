@@ -117,7 +117,7 @@ Three statements: the offer, the stored source file, and one `executemany`
 carrying all 5,000 lines. The Neon `db` stage confirms the same thing
 against a real network.
 
-### After the Server-Timing attribution fix — local SQLite
+### After the attribution fix, still reading back — local SQLite
 
 `http://localhost:8851` · 3 runs · answer key verified on every run
 
@@ -130,6 +130,20 @@ against a real network.
 | export .xlsx | 596 ms | 614 ms | 252 kB (gzip) | db 61, evaluate 78, **serialize 438** |
 | export .csv | 240 ms | 213 ms | 80 kB (gzip) | db 62, evaluate 124, serialize 35 |
 | **Whole workflow** | **2247 ms** | **2237 ms** | | |
+
+### Current — local SQLite, upload returns a receipt
+
+`http://localhost:8871` · 3 runs · answer key verified on every run
+
+| Step | First run | Repeat (median) | Wire | Server-Timing (first run) |
+| --- | ---: | ---: | ---: | --- |
+| upload (parse + store) | **413 ms** | 411 ms | **63 B** | parse 221, analyze 64, db 108 |
+| GET offer (review-ready) | 334 ms | 330 ms | 383 kB (gzip) | db 62, evaluate 106, serialize 32 |
+| save one decision | 7 ms | 4 ms | 127 B | db 5 |
+| re-fetch after save | 341 ms | 357 ms | 383 kB (gzip) | db 91, evaluate 84, serialize 33 |
+| export .xlsx | 630 ms | 633 ms | 252 kB (gzip) | db 85, evaluate 81, **serialize 446** |
+| export .csv | 270 ms | 269 ms | 80 kB (gzip) | db 70, evaluate 145, serialize 36 |
+| **Whole workflow** | **1995 ms** | **2005 ms** | | |
 
 ---
 
@@ -185,14 +199,14 @@ DATABASE_URL='postgresql+psycopg://…' python scripts/db_profile.py
 
 ### SQL per endpoint — SQLite, 5,000-row offer
 
-| Endpoint | SQL statements | Statement mix | Approx bytes from DB | Bound by |
-| --- | ---: | --- | ---: | --- |
-| `POST /api/offers` (upload) | 6 | INSERT×3 SELECT×3 | 2.47 MB | **volume** |
-| `GET /api/offers/{id}` | 3 | SELECT×3 | 2.30 MB | **volume** |
-| `POST /{id}/decisions` (1 line) | 7 | DELETE×1 INSERT×2 SELECT×3 UPDATE×1 | 510 B | neither — small and quick |
-| `GET /{id}/export.xlsx` | 3 | SELECT×3 | 2.30 MB | **volume** |
-| `GET /{id}/export.csv` | 3 | SELECT×3 | 2.30 MB | **volume** |
-| `GET /api/offers` (list) | 1 | SELECT×1 | 0 B | neither |
+| Endpoint | SQL statements | Statement mix | Bytes read | Bytes written | Bound by |
+| --- | ---: | --- | ---: | ---: | --- |
+| `POST /api/offers` (upload) | 4 | INSERT×3 SELECT×1 | 344 B | 2.47 MB | **volume** (write) |
+| `GET /api/offers/{id}` | 3 | SELECT×3 | 2.30 MB | 0 B | **volume** |
+| `POST /{id}/decisions` (1 line) | 7 | DELETE×1 INSERT×2 SELECT×3 UPDATE×1 | 439 B | 71 B | neither — small and quick |
+| `GET /{id}/export.xlsx` | 3 | SELECT×3 | 2.30 MB | 0 B | **volume** |
+| `GET /{id}/export.csv` | 3 | SELECT×3 | 2.30 MB | 0 B | **volume** |
+| `GET /api/offers` (list) | 1 | SELECT×1 | 344 B | 0 B | neither |
 
 _Statement counts are database-independent; the SQLite timings are not
 network-bound and are omitted._
@@ -211,17 +225,56 @@ exports.
 510 bytes, so its cost is ~7 × round-trip latency regardless of offer size.
 That is why saving stays fast on a 5,000-row sheet.
 
-## Candidate, not yet taken
+## Taken: the upload no longer reads back what it just wrote
 
-The upload writes 5,000 lines and then **reads all 5,000 back** to build its
-response. That read is the 2.47 MB above and most of the upload's `db` stage.
-It exists so the response is built from saved state like every other
-endpoint — the property that makes the download agree with the screen — but
-the same `StoredLine` objects were in memory moments earlier.
+The upload used to write 5,000 lines and then **read all 5,000 back** to
+build a full-offer response — 2.47 MB of reading, on top of the 2.47 MB it
+had just written.
 
-Not changed yet: the deployed, same-region numbers decide whether it is worth
-trading that guarantee for, and a measurement in the wrong region is not a
-reason to change code.
+The argument for keeping it was that the response should be built from saved
+state like every other endpoint. The argument against turned out to be
+decisive: **the UI navigates to the offer page and fetches the offer anyway**,
+so that response was discarded every single time. The server log shows it
+plainly — `POST /api/offers` followed immediately by `GET /api/offers/{id}`.
+
+`POST /api/offers` now returns a receipt, exactly like a save does:
+
+```json
+{"offer_id": "…", "version": 1}
+```
+
+"Everything the screen shows comes from one GET" is not weakened by this —
+it is strengthened. Nothing is rendered from the upload response at all.
+
+### Before and after
+
+| | Statements | Mix | Bytes read | Response |
+| --- | ---: | --- | ---: | ---: |
+| Upload, before | 6 | INSERT×3 **SELECT×3** | 2.47 MB | 5.73 MB (383 kB gzipped) |
+| Upload, after | 4 | INSERT×3 **SELECT×1** | **344 B** | **63 B** |
+
+The one remaining SELECT is the single offer row needed for the receipt.
+
+| Step | Before | After |
+| --- | ---: | ---: |
+| upload wall clock | 737 ms | **413 ms** |
+| upload `db` stage | 172 ms | **108 ms** |
+| upload `evaluate` stage | 104 ms | **gone** |
+| upload `serialize` stage | 31 ms | **gone** |
+| Whole workflow | 2247 ms | **1995 ms** |
+
+A 44% cut off the upload locally, where bytes are nearly free. On the
+laptop-to-Ohio link the upload's `db` was 6188 ms plus 2754 ms mislabelled as
+`evaluate`; roughly half of that was the read-back this removes.
+
+**The largest delay is now `export .xlsx` at 630 ms**, of which ~446 ms is
+openpyxl building 5,000 rows of styled cells. That is the next candidate, and
+`write_only` mode is the obvious approach — but the deployed numbers should
+justify it first.
+
+`test_upload_returns_a_receipt_not_the_whole_offer` pins the new contract:
+the body has exactly `offer_id` and `version`, is under 200 bytes, and the
+response carries no `evaluate` or `serialize` stage at all.
 
 ---
 
@@ -250,4 +303,41 @@ reason to change code.
 > and because it is the clearest demonstration that the offer-reading
 > endpoints are volume-bound.
 >
-> _Table pending — to be pasted from the run described in the README._
+> **Measured before the attribution fix**, so the upload's `evaluate` column
+> below is really a database read. Not re-run: the deployed, same-region
+> numbers are the ones that decide anything.
+
+| Step | First run | Repeat (median) | Wire | Uncompressed | Server-Timing (first run) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| upload (parse + store) | 9972 ms | 12316 ms | 383 kB (gzip) | 5.73 MB | parse 255, analyze 40, db 6188, evaluate 2754, serialize 35 |
+| GET offer (review-ready) | 4944 ms | 4942 ms | 383 kB (gzip) | 5.73 MB | db 4288, evaluate 92, serialize 64 |
+| save one decision | 967 ms | 958 ms | 127 B | same | db 961 |
+| re-fetch after save | 6019 ms | 5057 ms | 383 kB (gzip) | 5.73 MB | db 5339, evaluate 97, serialize 60 |
+| export .xlsx | 7216 ms | 5758 ms | 252 kB (gzip) | 297 kB | db 6262, evaluate 135, serialize 421 |
+| export .csv | 4566 ms | 5066 ms | 80 kB (gzip) | 647 kB | db 4005, evaluate 92, serialize 34 |
+| **Whole workflow** | **33684 ms** | **34096 ms** | | | |
+
+### What this table proves
+
+`db` is 85–95% of every step. The CPU stages barely move from their local
+values — `parse` 255 ms vs 219 local, `evaluate` ~92 ms vs ~85, `serialize`
+421 ms vs 438 for the .xlsx. **The code did not get slower; the database got
+further away.**
+
+The save is the useful calibration. 7 statements, 510 bytes, 961 ms — about
+**137 ms per statement**, which is the round-trip cost to Ohio including
+query overhead. Everything else follows from it:
+
+| Step | Statements | × 137 ms latency | Actual `db` | Remainder = transfer |
+| --- | ---: | ---: | ---: | ---: |
+| GET offer | 3 | ~411 ms | 4288 ms | **~3.9 s for 2.3 MB** |
+| export .csv | 3 | ~411 ms | 4005 ms | ~3.6 s |
+| save | 7 | ~959 ms | 961 ms | **~0 ms** |
+
+The save is entirely latency and no transfer; the offer reads are almost
+entirely transfer. That is the volume-vs-round-trips answer measured rather
+than argued, and it matches `db_profile.py` exactly.
+
+It also confirms the bulk insert: the upload writes 5,000 lines across a
+continent in one `executemany`. At 137 ms per statement, 5,000 individual
+INSERTs would have taken **over 11 minutes**.

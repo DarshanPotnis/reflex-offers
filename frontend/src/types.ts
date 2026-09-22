@@ -124,3 +124,9 @@ export interface LineErrors {
 export interface Config {
   fault_injection: boolean;
 }
+
+/** What POST /api/offers returns: enough to navigate, nothing more. */
+export interface UploadReceipt {
+  offer_id: string;
+  version: number;
+}

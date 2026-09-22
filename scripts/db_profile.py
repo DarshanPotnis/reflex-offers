@@ -110,12 +110,13 @@ def human(count: int) -> str:
     return f"{count} B"
 
 
-def verdict(statements: int, db_bytes: int) -> str:
-    if statements <= 6 and db_bytes > 500_000:
-        return "**volume** — few statements, lots of bytes"
+def verdict(statements: int, read: int, written: int) -> str:
+    moved = read + written
     if statements > 20:
         return "**round trips** — many statements"
-    if db_bytes < 50_000:
+    if moved > 500_000:
+        return "**volume** — few statements, lots of bytes"
+    if moved < 50_000:
         return "neither — small and quick"
     return "mixed"
 
@@ -140,7 +141,8 @@ def main() -> int:
 
     app.dependency_overrides[get_session] = session_dep
 
-    rows: list[tuple[str, Recorder, int]] = []
+    # (label, recorder, bytes read from the DB, bytes written to it)
+    rows: list[tuple[str, Recorder, int, int]] = []
     data = FIXTURE.read_bytes()
 
     with TestClient(app) as client:
@@ -150,7 +152,7 @@ def main() -> int:
                 files={"file": (FIXTURE.name, data, "application/vnd.ms-excel")},
             )
         created.raise_for_status()
-        offer_id = created.json()["id"]
+        offer_id = created.json()["offer_id"]
 
         # What the database actually had to send for a full offer read.
         with sessions() as session:
@@ -161,11 +163,15 @@ def main() -> int:
             line_bytes = sum(row_bytes(line) for line in lines)
             offer_bytes = row_bytes(offer_row) if offer_row else 0
         full_read = line_bytes + offer_bytes
-        rows.append(("POST /api/offers (upload)", rec, full_read + len(data)))
+        # The upload writes the lines and the source file, and reads back only
+        # the single offer row it needs for the receipt.
+        rows.append((
+            "POST /api/offers (upload)", rec, offer_bytes, line_bytes + len(data),
+        ))
 
         with watching(engine) as rec:
             client.get(f"/api/offers/{offer_id}").raise_for_status()
-        rows.append(("GET /api/offers/{id}", rec, full_read))
+        rows.append(("GET /api/offers/{id}", rec, full_read, 0))
 
         with watching(engine) as rec:
             saved = client.post(
@@ -190,20 +196,21 @@ def main() -> int:
         rows.append((
             "POST /{id}/decisions (1 line)",
             rec,
-            row_bytes(one) + sum(row_bytes(d) for d in decisions),
+            row_bytes(one),
+            sum(row_bytes(d) for d in decisions),
         ))
 
         with watching(engine) as rec:
             client.get(f"/api/offers/{offer_id}/export.xlsx").raise_for_status()
-        rows.append(("GET /{id}/export.xlsx", rec, full_read))
+        rows.append(("GET /{id}/export.xlsx", rec, full_read, 0))
 
         with watching(engine) as rec:
             client.get(f"/api/offers/{offer_id}/export.csv").raise_for_status()
-        rows.append(("GET /{id}/export.csv", rec, full_read))
+        rows.append(("GET /{id}/export.csv", rec, full_read, 0))
 
         with watching(engine) as rec:
             client.get("/api/offers").raise_for_status()
-        rows.append(("GET /api/offers (list)", rec, 0))
+        rows.append(("GET /api/offers (list)", rec, offer_bytes, 0))
 
     engine.dispose()
 
@@ -212,14 +219,14 @@ def main() -> int:
     print(f"`{url.split('@')[-1] if '@' in url else dialect}`\n")
     print(
         "| Endpoint | SQL statements | Statement mix | Total SQL time | "
-        "Median statement | Approx bytes from DB | Bound by |"
+        "Median statement | Bytes read | Bytes written | Bound by |"
     )
-    print("| --- | ---: | --- | ---: | ---: | ---: | --- |")
-    for name, rec, db_bytes in rows:
+    print("| --- | ---: | --- | ---: | ---: | ---: | ---: | --- |")
+    for name, rec, read, written in rows:
         print(
             f"| `{name}` | {rec.count} | {rec.verbs()} | {rec.total_ms:.0f} ms | "
-            f"{rec.median_ms:.1f} ms | {human(db_bytes)} | "
-            f"{verdict(rec.count, db_bytes)} |"
+            f"{rec.median_ms:.1f} ms | {human(read)} | {human(written)} | "
+            f"{verdict(rec.count, read, written)} |"
         )
     print()
     if temp_dir:

@@ -97,8 +97,8 @@ def one_run(base: str, timeout: float) -> list[Step]:
             client, "upload (parse + store)", "POST", "/api/offers",
             files={"file": (FIXTURE.name, data, "application/vnd.ms-excel")},
         )
-        offer = response.json()
-        offer_id = offer["id"]
+        # A receipt: the client navigates and fetches the offer itself.
+        offer_id = response.json()["offer_id"]
         steps.append(step)
 
         step, response = measure(client, "GET offer (review-ready)", "GET", f"/api/offers/{offer_id}")

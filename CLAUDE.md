@@ -170,7 +170,11 @@ All money in JSON is a **string** decimal (`"4.50"`). Pydantic models use
 `extra="forbid"`.
 
 - `POST /api/offers` — multipart `file`, optional header `Idempotency-Key`.
-  Same key again -> same offer (200), no second offer. Same key with a
+  Returns a **receipt**, `{offer_id, version}` — not the offer. The client
+  navigates to the offer page and fetches it there, so everything on screen
+  comes from one GET. Returning the full offer here meant reading all 5,000
+  stored lines back to build a response the UI discarded a moment later.
+  Same key again -> same offer's receipt (200), no second offer. Same key with a
   *different* file (`source_sha256` differs) -> 409; silently returning the
   first offer would hide the second upload entirely. Body over 10 MB -> 413.
   Unsupported file -> 422 with the reader's plain-English message.

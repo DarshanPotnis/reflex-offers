@@ -55,7 +55,7 @@ def count(sessions, model, offer_id) -> int:
 def test_uploaded_offer_matches_the_answer_key(client, name, layout, lines, pieces, cost, retail):
     created = upload(client, name)
     assert created.status_code == 201, created.text
-    offer_id = created.json()["id"]
+    offer_id = created.json()["offer_id"]
 
     body = client.get(f"/api/offers/{offer_id}").json()
     assert body["layout"] == layout
@@ -79,7 +79,7 @@ def test_money_is_never_a_float_in_json(client):
 
 
 def test_lines_carry_the_original_cells_for_checking_against_the_sheet(client):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     lines = {ln["line_id"]: ln for ln in client.get(f"/api/offers/{offer_id}").json()["lines"]}
 
     cost_cell = lines["R7"]["cells"]["unit_cost"]
@@ -90,7 +90,7 @@ def test_lines_carry_the_original_cells_for_checking_against_the_sheet(client):
 
 
 def test_notices_survive_the_round_trip(client):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     notices = client.get(f"/api/offers/{offer_id}").json()["notices"]
     assert any("Row 21 skipped" in n for n in notices)
 
@@ -117,14 +117,14 @@ def test_upload_over_the_limit_is_refused(client):
 
 def test_original_file_is_kept_byte_for_byte(client):
     name = "02-harbor-size-grid.xlsx"
-    offer_id = upload(client, name).json()["id"]
+    offer_id = upload(client, name).json()["offer_id"]
     assert client.get(f"/api/offers/{offer_id}/source").content == fixture_bytes(name)
 
 
 def test_server_timing_locates_the_slowest_stage(client):
     created = upload(client, "01-northstar-line-sheet.xlsx")
     assert "parse" in created.headers["server-timing"]
-    offer_id = created.json()["id"]
+    offer_id = created.json()["offer_id"]
     timing = client.get(f"/api/offers/{offer_id}").headers["server-timing"]
     assert "db" in timing and "evaluate" in timing and "serialize" in timing
 
@@ -136,7 +136,7 @@ def test_same_idempotency_key_makes_one_offer(client):
     second = upload(client, "01-northstar-line-sheet.xlsx", key="abc-123")
 
     assert first.status_code == 201 and second.status_code == 200
-    assert first.json()["id"] == second.json()["id"]
+    assert first.json()["offer_id"] == second.json()["offer_id"]
     assert len(client.get("/api/offers").json()["offers"]) == 1
 
 
@@ -149,8 +149,8 @@ def test_same_idempotency_key_with_a_different_file_is_refused(client):
 
 
 def test_two_uploads_without_a_key_stay_separate(client):
-    first = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
-    second = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    first = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
+    second = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     assert first != second
 
     save(client, first, [{"line_id": "R13", "action": "include", "quantity": 5}])
@@ -170,7 +170,7 @@ def test_recent_offers_are_capped(client, monkeypatch):
 # ---------- saving decisions ----------
 
 def test_saving_a_decision_bumps_the_version_and_changes_the_totals(client):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
 
     receipt = save(client, offer_id, [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}])
     assert receipt.status_code == 200
@@ -185,7 +185,7 @@ def test_saving_a_decision_bumps_the_version_and_changes_the_totals(client):
 
 def test_keep_this_one_resolves_a_whole_group_in_one_save(client):
     """CLAUDE.md: resolving a conflict must not leave a sibling open."""
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     before = client.get(f"/api/offers/{offer_id}").json()["summary"]["needs_decision_open"]
 
     response = save(client, offer_id, [
@@ -204,7 +204,7 @@ def test_keep_this_one_resolves_a_whole_group_in_one_save(client):
 
 
 def test_decisions_survive_a_new_connection(client, sessions):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     save(client, offer_id, [{"line_id": "R9", "action": "include", "unit_cost": "9.00"}])
 
     with sessions() as session:
@@ -214,7 +214,7 @@ def test_decisions_survive_a_new_connection(client, sessions):
 
 
 def test_reset_removes_the_decision_row(client, sessions):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     save(client, offer_id, [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}])
     assert count(sessions, DecisionRow, offer_id) == 1
 
@@ -226,7 +226,7 @@ def test_reset_removes_the_decision_row(client, sessions):
 # ---------- retries and versions ----------
 
 def test_replaying_a_request_id_changes_nothing(client, sessions):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     request_id = new_request_id()
     changes = [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}]
 
@@ -241,7 +241,7 @@ def test_replaying_a_request_id_changes_nothing(client, sessions):
 
 
 def test_request_id_reused_with_different_changes_is_refused(client):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     request_id = new_request_id()
 
     save(client, offer_id, [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}],
@@ -255,7 +255,7 @@ def test_request_id_reused_with_different_changes_is_refused(client):
 
 
 def test_stale_base_version_is_refused_and_saves_nothing(client, sessions):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     save(client, offer_id, [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}])
 
     stale = save(client, offer_id, [{"line_id": "R12", "action": "exclude"}], base_version=1)
@@ -269,7 +269,7 @@ def test_stale_base_version_is_refused_and_saves_nothing(client, sessions):
 def test_two_saves_on_the_same_base_version_only_one_wins(client, sessions):
     """The deterministic half of the race: whatever the timing, the second
     save must not silently overwrite the first."""
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
 
     first = save(client, offer_id, [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}],
                  base_version=1)
@@ -308,7 +308,7 @@ def test_concurrent_saves_on_one_base_version(client, sessions, is_postgres, _ru
     if not is_postgres:
         pytest.skip("SQLite serialises writers; this race only exists on Postgres")
 
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     results = run_together(sessions, [
         _save_job(offer_id, new_request_id(), [{"line_id": "R14", "action": "include",
                                                 "unit_cost": "5.00"}]),
@@ -333,7 +333,7 @@ def test_concurrent_duplicate_retries_apply_once(client, sessions, is_postgres, 
     if not is_postgres:
         pytest.skip("SQLite serialises writers; this race only exists on Postgres")
 
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     request_id = new_request_id()
     changes = [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}]
 
@@ -364,7 +364,7 @@ def test_a_duplicate_retry_that_loses_the_version_race_still_gets_its_receipt(
     Without the re-check at that point, this save would return 409 for work
     its own twin had just committed.
     """
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     request_id = new_request_id()
     changes = [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}]
 
@@ -398,7 +398,7 @@ def faults(monkeypatch):
 
 
 def test_after_commit_failure_then_retry_applies_exactly_once(client, sessions, faults):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     request_id = new_request_id()
     changes = [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}]
 
@@ -421,7 +421,7 @@ def test_after_commit_failure_then_retry_applies_exactly_once(client, sessions, 
 
 
 def test_before_commit_failure_saves_nothing(client, sessions, faults):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     changes = [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}]
 
     failed = save(client, offer_id, changes, headers={"X-Fault": "before-commit"})
@@ -435,7 +435,7 @@ def test_before_commit_failure_saves_nothing(client, sessions, faults):
 
 
 def test_fault_headers_are_ignored_unless_enabled(client):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     response = save(client, offer_id, [{"line_id": "R14", "action": "include",
                                         "unit_cost": "5.00"}],
                     headers={"X-Fault": "after-commit"})
@@ -467,7 +467,7 @@ BAD_CHANGES = [
 
 @pytest.mark.parametrize("change, expected", BAD_CHANGES)
 def test_invalid_values_are_refused_and_the_offer_is_unchanged(client, change, expected):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     before = client.get(f"/api/offers/{offer_id}").json()
 
     response = save(client, offer_id, [change])
@@ -481,7 +481,7 @@ def test_invalid_values_are_refused_and_the_offer_is_unchanged(client, change, e
 
 
 def test_errors_are_reported_against_their_line(client):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     response = save(client, offer_id, [
         {"line_id": "R9", "action": "include", "quantity": 12.5, "unit_cost": "9.00"},
     ])
@@ -490,7 +490,7 @@ def test_errors_are_reported_against_their_line(client):
 
 
 def test_one_bad_change_in_a_batch_applies_none(client, sessions):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     before = client.get(f"/api/offers/{offer_id}").json()
 
     response = save(client, offer_id, [
@@ -505,7 +505,7 @@ def test_one_bad_change_in_a_batch_applies_none(client, sessions):
 
 
 def test_empty_changes_is_refused(client):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     response = save(client, offer_id, [])
     assert response.status_code == 422
     assert "no changes" in response.json()["errors"][0]["messages"][0]
@@ -513,7 +513,7 @@ def test_empty_changes_is_refused(client):
 
 
 def test_the_same_line_twice_in_one_save_is_refused(client):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     response = save(client, offer_id, [
         {"line_id": "R14", "action": "include", "unit_cost": "5.00"},
         {"line_id": "R14", "action": "exclude"},
@@ -527,7 +527,7 @@ def test_the_same_line_twice_in_one_save_is_refused(client):
 
 @pytest.mark.parametrize("name, layout, lines, pieces, cost, retail", ANSWER_KEY)
 def test_export_agrees_with_the_screen(client, name, layout, lines, pieces, cost, retail):
-    offer_id = upload(client, name).json()["id"]
+    offer_id = upload(client, name).json()["offer_id"]
     summary = client.get(f"/api/offers/{offer_id}").json()["summary"]
 
     response = client.get(f"/api/offers/{offer_id}/export.csv")
@@ -546,7 +546,7 @@ def test_export_agrees_with_the_screen(client, name, layout, lines, pieces, cost
 
 
 def test_export_reflects_saved_decisions(client):
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     save(client, offer_id, [{"line_id": "R14", "action": "include", "unit_cost": "5.00"}])
 
     text = client.get(f"/api/offers/{offer_id}/export.csv").content.decode("utf-8-sig")
@@ -563,7 +563,7 @@ def test_export_reflects_saved_decisions(client):
 
 @pytest.mark.parametrize("name, layout, lines, pieces, cost, retail", ANSWER_KEY)
 def test_workbook_export_agrees_with_the_screen(client, name, layout, lines, pieces, cost, retail):
-    offer_id = upload(client, name).json()["id"]
+    offer_id = upload(client, name).json()["offer_id"]
     summary = client.get(f"/api/offers/{offer_id}").json()["summary"]
 
     response = client.get(f"/api/offers/{offer_id}/export.xlsx")
@@ -591,7 +591,7 @@ def test_workbook_export_agrees_with_the_screen(client, name, layout, lines, pie
 
 def test_workbook_keeps_item_codes_as_text(client):
     """Downloaded and reopened, 000101 is still 000101 and not 101."""
-    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
     data = client.get(f"/api/offers/{offer_id}/export.xlsx").content
 
     sheet = load_workbook(io.BytesIO(data))["Offer"]
@@ -604,7 +604,7 @@ def test_workbook_keeps_item_codes_as_text(client):
 
 
 def test_both_export_formats_carry_the_same_numbers(client):
-    offer_id = upload(client, "02-harbor-size-grid.xlsx").json()["id"]
+    offer_id = upload(client, "02-harbor-size-grid.xlsx").json()["offer_id"]
 
     csv_rows = client.get(f"/api/offers/{offer_id}/export.csv").content.decode(
         "utf-8-sig"
@@ -651,7 +651,7 @@ def test_five_thousand_lines_are_inserted_in_batches(client, db):
         event.remove(db, "before_cursor_execute", record)
 
     assert response.status_code == 201
-    offer_id = response.json()["id"]
+    offer_id = response.json()["offer_id"]
     assert client.get(f"/api/offers/{offer_id}").json()["summary"]["included_lines"] == 5_000
 
     inserts = [e for e in executions if e[0] == "INSERT"]
@@ -699,7 +699,7 @@ def test_no_sql_runs_inside_the_evaluate_stage(client, db, monkeypatch):
     monkeypatch.setattr(service, "Timings", WatchedTimings)
     event.listen(db, "before_cursor_execute", record)
     try:
-        offer_id = upload(client, "03-northstar-5000-rows.xlsx").json()["id"]
+        offer_id = upload(client, "03-northstar-5000-rows.xlsx").json()["offer_id"]
         client.get(f"/api/offers/{offer_id}")
         client.get(f"/api/offers/{offer_id}/export.xlsx")
         client.get(f"/api/offers/{offer_id}/export.csv")
@@ -714,3 +714,24 @@ def test_no_sql_runs_inside_the_evaluate_stage(client, db, monkeypatch):
     assert sql_during.get("serialize", 0) == 0
     # And the reads really are being counted somewhere.
     assert sql_during.get("db", 0) >= 4, sql_during
+
+
+def test_upload_returns_a_receipt_not_the_whole_offer(client):
+    """The client navigates and fetches; building a 5.7 MB response here
+    only to replace it a moment later cost a full read-back of every line."""
+    response = upload(client, "03-northstar-5000-rows.xlsx")
+
+    assert response.status_code == 201
+    assert set(response.json()) == {"offer_id", "version"}
+    assert response.json()["version"] == 1
+    assert len(response.content) < 200, response.content[:200]
+
+    # Nothing is evaluated or serialised on this path any more.
+    timing = response.headers["server-timing"]
+    assert "parse" in timing and "db" in timing
+    assert "evaluate" not in timing and "serialize" not in timing
+
+    # And the offer is genuinely there, with the answer key intact.
+    body = client.get(f"/api/offers/{response.json()['offer_id']}").json()
+    assert body["summary"]["pieces"] == 62_444
+    assert body["summary"]["supplier_cost"] == "187214.50"

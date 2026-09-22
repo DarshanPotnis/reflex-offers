@@ -22,8 +22,8 @@ export function HomePage() {
       setBusy(true);
       setError(null);
       try {
-        const offer = await uploadOffer(file);
-        navigate(`/offers/${offer.id}`);
+        const receipt = await uploadOffer(file);
+        navigate(`/offers/${receipt.offer_id}`);
       } catch (caught) {
         // The reader's message is written for a person; show it as-is.
         setError(

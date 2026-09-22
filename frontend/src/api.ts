@@ -5,6 +5,7 @@ import type {
   Offer,
   OfferListing,
   Receipt,
+  UploadReceipt,
 } from "./types";
 
 /**
@@ -88,10 +89,14 @@ export const getOffer = (id: string) =>
 export const listOffers = () =>
   request<{ offers: OfferListing[] }>("/api/offers").then((r) => r.offers);
 
-export function uploadOffer(file: File): Promise<Offer> {
+/**
+ * Returns a receipt, not the offer. The page it navigates to fetches the
+ * offer itself, so everything on screen comes from one GET.
+ */
+export function uploadOffer(file: File): Promise<UploadReceipt> {
   const body = new FormData();
   body.append("file", file);
-  return request<Offer>("/api/offers", { method: "POST", body });
+  return request<UploadReceipt>("/api/offers", { method: "POST", body });
 }
 
 export function saveDecisions(

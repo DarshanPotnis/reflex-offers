@@ -239,17 +239,13 @@ async def upload_offer(
             offer_id=exc.existing_id,
         ) from exc
 
-    # Pass `timings` in: load_evaluated re-reads every stored line, and
-    # without this that read lands inside the caller's `evaluate` stage and
-    # blames CPU for what is network. It cost 2.7 s of mislabelled time on a
-    # cross-country Neon link before anyone noticed.
-    _, evaluated = service.load_evaluated(session, offer.id, timings)
-    with timings.stage("serialize"):
-        body = offer_json(offer, evaluated)
-
+    # A receipt, not the offer. The client navigates to the offer page and
+    # fetches it there, so building a 5.7 MB response here only to have it
+    # replaced a moment later was pure waste — and it cost a full read-back
+    # of all 5,000 stored lines to produce.
     response.status_code = 200 if replayed else 201
     response.headers["Server-Timing"] = timings.header()
-    return body
+    return {"offer_id": offer.id, "version": offer.version}
 
 
 @router.get("/config")
