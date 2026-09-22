@@ -190,8 +190,48 @@ it proves the round-trips-versus-volume question:
   `test_five_thousand_lines_are_inserted_in_batches` asserts it directly:
   `5,000 lines -> 3 INSERT statement(s)`.
 
-> **Deployed measurements: `<to be filled in after deploy>`** — same script,
-> `python scripts/measure.py https://<app>.onrender.com --runs 3`.
+**Deployed, Render Free + Neon both in Ohio** (full table and analysis in
+[docs/speed.md](docs/speed.md)):
+
+| Step | First run | Repeat |
+| --- | ---: | ---: |
+| upload | 10223 ms | 9184 ms |
+| GET offer | 5518 ms | 5718 ms |
+| save one decision | **146 ms** | 124 ms |
+| export .xlsx | 10581 ms | 10854 ms |
+| **Whole workflow** | **36688 ms** | **34799 ms** |
+
+Two things this settles:
+
+**Co-locating the app with the database worked.** The save — 7 statements
+moving 510 bytes, so pure round-trip latency — fell from **961 ms to ~130 ms**
+once both sat in Ohio. That step is the cleanest available measure of distance
+to the database, and about 7/8 of it was distance.
+
+**The Free instance's CPU is now the constraint**, at roughly 0.1 vCPU. Five
+independent stages scale by a **15.4× median** against the local baseline —
+an instance-size effect rather than anything in the code. The largest single
+stage in the whole workflow is the `.xlsx` export's `serialize` at **8002 ms**,
+openpyxl building 5,000 styled rows.
+
+The wall clock also exceeds the reported stages by ~2.4 s on the big reads,
+because `Server-Timing` is recorded inside the route while compression and
+response transmission happen after it. Measured on the real payload, gzip at
+the configured level 6 accounts for ~431 ms of that; the rest is sending
+383 kB at about 1.7 Mbps.
+
+A second run taken after switching the plan to Starter came back within 1% of
+Free on every CPU-bound stage, which a real change of instance size cannot do.
+The service is Blueprint-managed, so `render.yaml` — which still said
+`plan: free` — was overriding the dashboard. It now says `plan: starter`, and
+`/api/health` reports the container's CPU quota so a future table states its
+own hardware.
+
+> **Render Starter measurement: `<to be filled in>`** — same script, no code
+> change, isolating instance size. Two optimisations are queued behind it and
+> will be measured separately: openpyxl `write_only` mode for the export, and
+> a lower gzip level (which on the Free link measured *net worse*, so it is
+> genuinely open).
 
 ### Failure and recovery — [docs/failure-demo.md](docs/failure-demo.md)
 
@@ -274,9 +314,15 @@ users hear the state change.
 
 | Service | Plan | Cost | Caveat |
 | --- | --- | --- | --- |
-| Render web service | Free | $0 | **Sleeps after 15 min idle**; first request then waits ~30–60 s |
+| Render web service | **Starter** (set in `render.yaml`) | **$7/month** | Does not sleep |
 | Neon Postgres | Free | $0 | Suspends when idle; 0.5 GB storage |
-| **Total** | | **$0/month** | |
+| **Total** | | **$7/month** | |
+
+Free is $0 and works, with two costs: it **sleeps after 15 minutes idle**, so
+the first request waits ~30–60 s, and its ~0.1 vCPU makes CPU the bottleneck —
+the whole 5,000-row workflow took ~36 s there. Starter removes the sleep and
+the review is not spent waiting on cold starts. Set `plan: free` in
+`render.yaml` when it is over.
 
 Storage is small: the 5,000-row offer is ~2.5 MB of rows plus a 170 kB stored
 source file, so the free tier holds roughly 150 such offers.

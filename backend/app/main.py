@@ -16,6 +16,7 @@ from sqlalchemy import Engine
 
 from .api import register_handlers, router
 from .db import ConfigurationError, create_tables, get_engine
+from .runtime import cpu_info
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -48,7 +49,14 @@ def create_app(engine: Engine | None = None) -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict[str, object]:
-        return {"ok": True, "fault_injection": os.environ.get("FAULT_INJECTION") == "1"}
+        # The CPU quota is here so every measurement records the hardware it
+        # ran on. A plan change that silently did not apply is otherwise
+        # indistinguishable from a change that did nothing.
+        return {
+            "ok": True,
+            "fault_injection": os.environ.get("FAULT_INJECTION") == "1",
+            **cpu_info(),
+        }
 
     if FRONTEND_DIR.is_dir():
         _serve_frontend(app)

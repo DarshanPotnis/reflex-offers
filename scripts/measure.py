@@ -86,6 +86,23 @@ def measure(client: httpx.Client, name: str, method: str, url: str, **kwargs) ->
     return step, response
 
 
+def describe_host(base: str, timeout: float) -> str:
+    """Which hardware answered. Recorded so a run can be compared later."""
+    try:
+        with httpx.Client(base_url=base, timeout=timeout) as client:
+            health = client.get("/api/health").json()
+    except Exception:
+        return "host: unknown (/api/health did not answer)"
+    limit = health.get("cpu_limit")
+    allowed = f"{limit} vCPU" if limit is not None else "no CPU quota"
+    return (
+        f"host: {allowed} · host reports {health.get('cpu_count')} cores "
+        f"({health.get('cpu_limit_source')}) · "
+        f"{health.get('workers')} worker(s) · "
+        f"fault injection {'on' if health.get('fault_injection') else 'off'}"
+    )
+
+
 def one_run(base: str, timeout: float) -> list[Step]:
     steps: list[Step] = []
     # Accept gzip the way a browser does, so the wire size is the real one.
@@ -155,11 +172,13 @@ def human_bytes(count: int) -> str:
     return f"{count} B"
 
 
-def render(runs: list[list[Step]], base: str, label: str) -> str:
+def render(runs: list[list[Step]], base: str, label: str, host: str) -> str:
     out: list[str] = []
     out.append(f"### {label}")
     out.append("")
     out.append(f"`{base}` · {len(runs)} runs · answer key verified on every run")
+    out.append("")
+    out.append(f"_{host}_")
     out.append("")
 
     names = [step.name for step in runs[0]]
@@ -221,12 +240,15 @@ def main() -> int:
         raise SystemExit(f"fixture not found: {FIXTURE}")
 
     base = args.base_url.rstrip("/")
+    host = describe_host(base, args.timeout)
+    print(host, file=sys.stderr, flush=True)
+
     runs: list[list[Step]] = []
     for index in range(args.runs):
         print(f"run {index + 1}/{args.runs}…", file=sys.stderr, flush=True)
         runs.append(one_run(base, args.timeout))
 
-    report = render(runs, base, args.label or f"Measured against {base}")
+    report = render(runs, base, args.label or f"Measured against {base}", host)
     print(report)
     if args.out:
         args.out.write_text(report)

@@ -70,3 +70,49 @@ def test_sqlite_engines_wait_for_the_write_lock(tmp_path):
             assert connection.exec_driver_sql("select 1").scalar() == 1
     finally:
         engine.dispose()
+
+
+# ---------- which hardware answered ----------
+
+def test_cpu_info_reports_what_it_knows():
+    from app.runtime import cpu_info
+
+    info = cpu_info()
+    assert isinstance(info["cpu_count"], int) and info["cpu_count"] >= 1
+    assert info["cpu_limit"] is None or info["cpu_limit"] > 0
+    assert isinstance(info["cpu_limit_source"], str) and info["cpu_limit_source"]
+    assert isinstance(info["workers"], int) and info["workers"] >= 1
+
+
+def test_a_cgroup_v2_quota_is_read_as_a_fraction(tmp_path, monkeypatch):
+    """0.5 vCPU has to read as 0.5, not as the host's core count."""
+    from app import runtime
+
+    quota = tmp_path / "cpu.max"
+    quota.write_text("50000 100000\n")
+    monkeypatch.setattr(runtime, "CGROUP_V2", quota)
+    assert runtime.cpu_info()["cpu_limit"] == 0.5
+
+
+def test_an_unlimited_cgroup_reports_no_limit(tmp_path, monkeypatch):
+    from app import runtime
+
+    quota = tmp_path / "cpu.max"
+    quota.write_text("max 100000\n")
+    monkeypatch.setattr(runtime, "CGROUP_V2", quota)
+    monkeypatch.setattr(runtime, "CGROUP_V1_QUOTA", tmp_path / "missing")
+    assert runtime.cpu_info()["cpu_limit"] is None
+
+
+def test_worker_count_comes_from_the_environment(monkeypatch):
+    from app.runtime import cpu_info
+
+    monkeypatch.setenv("WEB_CONCURRENCY", "2")
+    assert cpu_info()["workers"] == 2
+
+
+def test_health_reports_the_hardware(client):
+    body = client.get("/api/health").json()
+    assert body["ok"] is True
+    assert "cpu_count" in body and "cpu_limit" in body
+    assert "cpu_limit_source" in body and "workers" in body

@@ -66,14 +66,14 @@ docker run -p 8000:8000 -e DATABASE_URL="sqlite:////tmp/app.db" reflex-offers
 
 ```bash
 cd backend
-python -m pytest -q                    # 172 passed, 6 skipped
+python -m pytest -q                    # 177 passed, 6 skipped
 ```
 
 Against Postgres, where the concurrency tests actually mean something:
 
 ```bash
 TEST_DATABASE_URL='postgresql+psycopg://USER:PASSWORD@HOST/reflex_offers_test' \
-  python -m pytest -q                  # 178 passed
+  python -m pytest -q                  # 183 passed
 ```
 
 The six skips are threaded race tests. SQLite serialises writers, so the
@@ -99,6 +99,7 @@ read from the API, so it cannot pass by agreeing with itself.
 | `FAULT_INJECTION` | unset | `1` enables the `X-Fault` header and the UI test toggle |
 | `PORT` | `8000` | Set by Render |
 | `TEST_DATABASE_URL` | unset | Runs the test suite against Postgres |
+| `WEB_CONCURRENCY` | `1` (Render: `2`) | uvicorn worker processes |
 
 If your shell exports a `DATABASE_URL` for another project, unset it for this
 one — `env -u DATABASE_URL uvicorn app.main:app`. A URL the app cannot use (a
@@ -134,6 +135,9 @@ project for running the test suite against Postgres. Do not point the tests at
    check on `/api/health`.
 3. Render prompts for **`DATABASE_URL`**, because it is marked `sync: false`
    and is never committed. Paste the `postgresql+psycopg://…/neondb` string.
+   Everything else — plan, region, workers — comes from the blueprint. The
+   service is Blueprint-managed, so **changing the plan in the dashboard is
+   reverted on the next deploy**; edit `render.yaml` instead.
 4. Deploy. The first build takes a few minutes (it builds the frontend, then
    the Python image). Tables are created on startup — there is no migration
    step at this scale.
@@ -154,7 +158,8 @@ timings for an offer whose totals have drifted.
 
 ### Cost
 
-The free Render plan **sleeps after 15 minutes idle**, so the first request
-after a pause waits ~30–60 s for a cold start. Neon's free tier also suspends
-an idle database. For a review link that is worth knowing about but not worth
-paying for; see [HANDOFF.md](HANDOFF.md) for the paid option that removes it.
+`render.yaml` specifies **Starter ($7/month)** for the review window. Free is
+$0 but **sleeps after 15 minutes idle** — the first request then waits
+~30–60 s — and its ~0.1 vCPU made CPU the bottleneck in every measurement
+([docs/speed.md](docs/speed.md)). Neon's free tier is $0 and suspends when
+idle. Set `plan: free` in `render.yaml` when the review is over.

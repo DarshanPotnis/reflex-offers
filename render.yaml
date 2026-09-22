@@ -11,7 +11,12 @@ services:
     # Same region as the Neon database. On a laptop-to-Ohio link the offer
     # reads cost seconds; co-locating removes that entirely. See docs/speed.md.
     region: ohio
-    plan: free
+    # This service is Blueprint-managed, so render.yaml is authoritative:
+    # changing the plan in the dashboard is reverted on the next deploy.
+    # Starter for the review window — it does not sleep, and Free's ~0.1 vCPU
+    # made CPU the bottleneck (see docs/speed.md). Drop back to `free` when
+    # the review is over.
+    plan: starter
     healthCheckPath: /api/health
     autoDeploy: false
     envVars:
@@ -24,3 +29,10 @@ services:
         value: "1"
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: WEB_CONCURRENCY
+        # Two uvicorn workers. Endpoints are sync, so FastAPI runs them in a
+        # threadpool — but openpyxl is pure Python and an 8 s .xlsx export
+        # holds the GIL, starving everything else in that process. A second
+        # worker keeps the health check and other requests answering. Raise
+        # only with more CPU; lower to 1 if memory gets tight.
+        value: "2"

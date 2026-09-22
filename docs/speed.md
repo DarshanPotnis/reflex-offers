@@ -14,6 +14,12 @@ pieces · $187,214.50 · $1,031,508.00 retail) and exits rather than print
 timings for an offer whose totals have drifted. A fast number that is also
 wrong is worse than a slow one.
 
+Every table states the hardware it ran on. `measure.py` reads `/api/health`
+first and prints the container's effective CPU quota, worker count and whether
+fault injection is on — because a measurement whose machine is unknown cannot
+be compared to anything later, and a plan change that silently failed to apply
+is otherwise indistinguishable from one that did nothing.
+
 Each measured set runs against a server started fresh from the current build,
 so nothing here is stale code.
 
@@ -285,16 +291,166 @@ response carries no `evaluate` or `serialize` stage at all.
 
 ## Deployed numbers
 
-> **To be captured after Phase 5**, with the same script against the Render
-> URL and its Neon database:
->
-> ```bash
-> python scripts/measure.py https://<app>.onrender.com --runs 3
-> ```
->
-> This is the measurement the brief actually asks for. Expected to show the
-> compression trade paying off, and the `db` stage on the upload confirming
-> the bulk insert.
+### Render **Free** + Neon, both in Ohio
+
+`python scripts/measure.py https://<app>.onrender.com --runs 3` · answer key
+verified on every run.
+
+| Step | First run | Repeat (median) | Wire | Uncompressed | Server-Timing (first run) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| upload (parse + store) | 10223 ms | 9184 ms | 63 B | same | parse 3982, analyze 599, db 4706 |
+| GET offer (review-ready) | 5518 ms | 5718 ms | 383 kB (gzip) | 5.73 MB | db 1264, evaluate 1389, serialize 494 |
+| save one decision | 146 ms | 124 ms | 127 B (gzip) | same | db 51 |
+| re-fetch after save | 6163 ms | 5293 ms | 383 kB (gzip) | 5.73 MB | db 1431, evaluate 1297, serialize 1289 |
+| export .xlsx | 10581 ms | 10854 ms | 252 kB (gzip) | 297 kB | db 775, evaluate 1187, serialize 8002 |
+| export .csv | 4057 ms | 3627 ms | 80 kB (gzip) | 647 kB | db 994, evaluate 2006, serialize 590 |
+| **Whole workflow** | **36688 ms** | **34799 ms** | | | |
+
+#### A second run, labelled Starter — invalid pending verification
+
+A later run taken after switching the plan to Starter produced numbers that
+match the Free run almost exactly: whole workflow 36192 / 36024 ms against
+36688 / 34799 ms, and `serialize` on the .xlsx export 8103 ms against 8002 ms.
+
+A genuine change of instance size cannot leave a CPU-bound stage within 1% of
+where it was. **The most likely explanation is that the plan change never took
+effect** — the service is Blueprint-managed, so `render.yaml` is authoritative
+and a dashboard change to the plan can be reverted on the next deploy.
+
+That table is therefore **not recorded as a Starter measurement**. It is kept
+below only as a second sample of Free, and the analysis in this document is
+drawn from the two together, since they agree.
+
+| Step | "Starter" run 1 | Repeat | Server-Timing (first run) |
+| --- | ---: | ---: | --- |
+| upload | 10634 ms | 9949 ms | parse 3707, analyze 1299, db 4908 |
+| GET offer | 5090 ms | 5384 ms | db 804, evaluate 1684, serialize 511 |
+| save | 131 ms | 127 ms | db 40 |
+| re-fetch | 5222 ms | 5446 ms | db 1326, evaluate 1285, serialize 497 |
+| export .xlsx | 11038 ms | 11306 ms | db 1408, evaluate 1099, serialize 8103 |
+| export .csv | 4077 ms | 3812 ms | db 975, evaluate 2196, serialize 496 |
+| **Whole workflow** | **36192 ms** | **36024 ms** | |
+
+`render.yaml` now sets `plan: starter` so the blueprint itself carries the
+change, and `/api/health` reports the container's effective CPU quota, which
+`measure.py` prints in its header. A future table therefore records the
+hardware it ran on and this ambiguity cannot recur.
+
+#### Co-location worked
+
+**The save went from 961 ms to 127 ms.** That step is 7 statements moving 510
+bytes — pure round-trip latency, nothing else — so it is the cleanest possible
+measure of the distance to the database. Putting the app in Ohio beside Neon
+removed about 7/8 of it.
+
+The offer reads did not improve the same way, because their `db` stage was
+never latency: it is 2.3 MB of transfer. `db` on the GET fell from 4288 ms to
+804 ms, which is the same 2.3 MB over a much shorter wire.
+
+#### The CPU is the new constraint
+
+Render's Free instance is roughly 0.1 vCPU. Every CPU stage scales almost
+uniformly against the local baseline:
+
+| Stage | Local | Free | Ratio |
+| --- | ---: | ---: | ---: |
+| `parse` (upload) | 221 ms | 3982 ms | 18.0× |
+| `analyze` (upload) | 64 ms | 599 ms | 9.4× |
+| `evaluate` (GET) | 106 ms | 1389 ms | 13.1× |
+| `serialize` (GET) | 32 ms | 494 ms | 15.4× |
+| `serialize` (.xlsx) | 446 ms | 8002 ms | 17.9× |
+
+A median of **15.4×**. The spread (9.4× to 18.0×) is wider than the second
+sample suggested, so treat it as an order-of-magnitude figure rather than a
+constant — a single run per configuration is not enough to pin it tighter.
+
+**`serialize` on the .xlsx export — 8002 ms — is now the single largest stage
+in the whole workflow**, on its own about a quarter of the total. It is
+openpyxl building 5,000 rows of styled cells at roughly 0.1 vCPU.
+
+#### Where the missing wall-clock time goes
+
+The GET's wall clock (5518 ms) is well above the sum of its stages (3147 ms).
+`Server-Timing` is written inside the route handler, and `GZipMiddleware`
+wraps the application, so **compression runs after the header is already
+recorded and is invisible to the stages.** The same is true of sending the
+response.
+
+Measuring the gap on every row, using the save row as the network baseline
+(127 bytes, nothing of ours to compress, so its 95 ms is round-trip plus TLS):
+
+| Step | Wall | Stages | Gap |
+| --- | ---: | ---: | ---: |
+| save (127 B) | 146 ms | 51 ms | **95 ms** ← baseline |
+| upload (63 B response) | 10223 ms | 9287 ms | 936 ms |
+| GET offer (383 kB on the wire) | 5518 ms | 3147 ms | **2371 ms** |
+| re-fetch (383 kB) | 6163 ms | 4017 ms | 2146 ms |
+| export .xlsx (252 kB) | 10581 ms | 9964 ms | 617 ms |
+| export .csv (80 kB) | 4057 ms | 3590 ms | 467 ms |
+
+**A caveat on that baseline row.** `measure.py` labels the 127-byte save
+response `gzip`, but our middleware has `minimum_size=1024` and cannot have
+compressed it. Either Render's edge added the encoding, or the response
+arrived chunked and the script fell back to the decoded length for the wire
+size. It does not affect any conclusion here — the row is used only as a
+round-trip baseline — but the wire column for small responses should not be
+taken literally.
+
+#### Compression explains about a quarter of that gap, not most of it
+
+Measured directly on the real 5,732,959-byte payload, and scaled by the 15.4×
+factor above:
+
+| Level | Local | Implied at Free | Bytes out | vs level 6 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 13 ms | ~200 ms | 598,891 | +56.4% |
+| 3 | 14 ms | ~216 ms | 457,876 | +19.5% |
+| 5 | 25 ms | ~385 ms | 401,915 | +4.9% |
+| **6 (current)** | **28 ms** | **~431 ms** | **383,002** | — |
+| 9 | 110 ms | ~1694 ms | 352,683 | −7.9% |
+
+So at the configured level 6, compression costs roughly **431 ms of the
+2371 ms gap**. Baseline network is 95 ms. That leaves **~1845 ms**, which is
+sending 383 kB — an effective throughput of about 1.7 Mbps on this
+measurement.
+
+**A note on the hypothesis:** the mechanism was exactly right — compression
+does run after `Server-Timing` is recorded, so it is invisible in the stages —
+but the middleware is configured at **level 6, not 9**. Had it been 9, gzip
+alone would have been ~1694 ms and would have explained most of the gap. At 6
+it explains under a fifth.
+
+#### What this implies for lowering the compression level
+
+Dropping 6 → 5 saves ~46 ms of CPU and costs 18,913 more bytes. At the
+~1.7 Mbps implied above, those bytes take ~91 ms to send — so on *this* link
+the change is **net worse**, by roughly the same margin it saves. It becomes worthwhile
+only on a faster instance where CPU is cheaper relative to bandwidth, which is
+precisely what the Starter measurement will show. Worth deciding from that
+table rather than this one.
+
+The bigger lever is that the response is 5.73 MB before compression at all.
+
+#### Instance sizing, for the record
+
+Measured in a container capped at 0.5 CPU with two uvicorn workers: **158 MiB
+idle, 196 MiB after a 5,000-row upload, 243 MiB peak during an .xlsx export.**
+Starter's 512 MB holds that comfortably, even with both workers busy.
+
+Two workers, not one: endpoints are sync so FastAPI runs them in a threadpool,
+but openpyxl is pure Python and an 8-second export holds the GIL, starving
+everything else in the process. With a second worker, `/api/health` answered
+in 3.9 ms while an export was running. Set by `WEB_CONCURRENCY`, so it is one
+environment variable to change.
+
+Also worth knowing: two workers at 0.5 CPU take **more than 7 seconds to
+finish starting**. The container `HEALTHCHECK` allows a 20-second start
+period; anything stricter would report a healthy service as failed.
+
+> **Render Starter measurement: pending.** Same script, no code change, so the
+> only variable is the instance size. `render.yaml` now carries
+> `plan: starter`, and `measure.py` prints the CPU quota reported by
+> `/api/health` in its header — so the next table states its own hardware.
 
 ## Laptop to Neon Ohio — **not representative of deployment**
 
