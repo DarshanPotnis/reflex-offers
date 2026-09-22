@@ -14,3 +14,7 @@ frontend/dist/
 
 # built frontend, produced by `npm run build`
 backend/static/
+
+# Working files for the AI-assisted build; kept locally, not part of the deliverable.
+CLAUDE.md
+PROMPTS.md

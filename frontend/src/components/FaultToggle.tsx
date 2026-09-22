@@ -22,7 +22,9 @@ export function FaultToggle({
           onChange={(event) => onChange(event.target.checked)}
         />
         <span>
-          <strong>Test mode: fail the next save (after commit)</strong>
+          <strong>Test mode (enabled for this review)</strong>
+          <br />
+          <span>Fail the next save, after it commits.</span>
           <br />
           <span className="tiny muted">
             The save commits, then the server reports a failure — the dangerous

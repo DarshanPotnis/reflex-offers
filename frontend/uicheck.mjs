@@ -220,6 +220,8 @@ try {
   // ------------------------------------------- failure, refresh, retry
   step("5. Test mode: fail the next save, refresh mid-failure, then retry");
   check("fault toggle is visible when enabled", await page.locator(".fault-box").isVisible());
+  check("the toggle says it is a test affordance",
+    (await page.locator(".fault-box").innerText()).includes("Test mode (enabled for this review)"));
   await shot(page, "failure-1-before");
   await page.locator('.fault-box input[type="checkbox"]').check();
 

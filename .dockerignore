@@ -1,0 +1,33 @@
+# Everything the image builds for itself, or must never contain.
+**/.venv/
+**/venv/
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+.git/
+.gitignore
+
+# Built artefacts: the image builds the frontend from source.
+backend/static/
+frontend/dist/
+
+# Local databases and secrets.
+*.db
+*.sqlite
+.env
+**/.env
+
+# Not needed at runtime.
+docs/
+scripts/
+backend/tests/
+frontend/uicheck.mjs
+CLAUDE.md
+PROMPTS.md
+HANDOFF.md
+README.md
+.DS_Store
+.idea/
+.vscode/

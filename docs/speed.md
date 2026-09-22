@@ -15,7 +15,12 @@ timings for an offer whose totals have drifted. A fast number that is also
 wrong is worse than a slow one.
 
 Each measured set runs against a server started fresh from the current build,
-so nothing here is stale code. Run 1 is a cold process; runs 2–3 are repeats
+so nothing here is stale code.
+
+The full test suite also runs against the real Neon database — `178 passed in
+594.70s`, including the threaded version-race and duplicate-retry tests that
+skip on SQLite. The ten minutes are almost entirely round-trip latency from
+a laptop in Los Angeles to Ohio; see the table at the bottom. Run 1 is a cold process; runs 2–3 are repeats
 into a warm one. Every run uploads a new offer, so parsing is never cached.
 
 ---

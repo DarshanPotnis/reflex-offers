@@ -1,0 +1,26 @@
+# Render blueprint: one web service, one URL.
+#
+# DATABASE_URL is deliberately NOT here. It carries the Neon password, and
+# this file is public. `sync: false` makes Render prompt for it once in the
+# dashboard and keep it as a secret.
+services:
+  - type: web
+    name: reflex-offers
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # Same region as the Neon database. On a laptop-to-Ohio link the offer
+    # reads cost seconds; co-locating removes that entirely. See docs/speed.md.
+    region: ohio
+    plan: free
+    healthCheckPath: /api/health
+    autoDeploy: false
+    envVars:
+      - key: DATABASE_URL
+        sync: false # set in the dashboard: postgresql+psycopg://…/neondb
+      - key: FAULT_INJECTION
+        # On for this review so the failure demo can be reproduced in the
+        # live app. It only enables the X-Fault header; nothing fails on its
+        # own. Remove this for real use.
+        value: "1"
+      - key: PYTHONUNBUFFERED
+        value: "1"
