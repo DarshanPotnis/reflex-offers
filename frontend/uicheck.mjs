@@ -42,6 +42,66 @@ async function shot(page, name) {
   console.log(`  SHOT  ${path.relative(process.cwd(), file)}`);
 }
 
+// The whole page in one image. The save bar is position: fixed, and a plain
+// fullPage capture paints it over the middle of the page, so the viewport is
+// made as tall as the document for the shot and then put back.
+async function shotFull(page, name) {
+  if (!SHOTS) return;
+  await fs.mkdir(SHOTS, { recursive: true });
+  const size = page.viewportSize();
+  const height = await page.evaluate(() => document.documentElement.scrollHeight);
+  await page.setViewportSize({ width: size.width, height });
+  await page.waitForTimeout(200);
+  const file = path.join(SHOTS, `${name}.png`);
+  await page.screenshot({ path: file });
+  await page.setViewportSize(size);
+  console.log(`  SHOT  ${path.relative(process.cwd(), file)}`);
+}
+
+const count = (text) => Number(String(text).replace(/,/g, ""));
+const asked = (offer) =>
+  offer.lines.filter((l) => l.issues.some((i) => i.kind === "needs_decision")).length;
+const leftOut = (offer) =>
+  offer.lines.filter((l) => l.status === "excluded" && !l.needs_decision_open);
+
+// The summary panel's top level must reconcile to the lines read:
+// ready + left out + need your decision. "Cleaned up" and "worth a look" sit
+// inside ready and count ready lines only. Every number is checked against
+// the API, and "lines read" against both the sentence and the API.
+async function checkSummaryReconciles(p, offer, name) {
+  const lead = await p.locator(".overview-lead").innerText();
+  const read = count(lead.match(/^Read ([\d,]+) lines?/)[1]);
+  const top = async (kind) =>
+    count(await p.locator(`.chip[data-kind="${kind}"] > b`).innerText());
+  const within = async (kind) => {
+    const el = p.locator(`.chip[data-kind="ready"] [data-kind="${kind}"] > b`);
+    return (await el.count()) === 0 ? 0 : count(await el.innerText());
+  };
+  const ready = await top("ready");
+  const out = await top("left-out");
+  const needs = await top("needs");
+  check(`${name}: ready + left out + need your decision == lines read`,
+    ready + out + needs === read && read === offer.summary.total_lines,
+    `${ready} + ${out} + ${needs} = ${ready + out + needs}; read ${read}; ` +
+      `API ${offer.summary.total_lines}`);
+  check(`${name}: each top-level number matches the API`,
+    ready === offer.summary.included_lines &&
+      out === leftOut(offer).length &&
+      needs === offer.summary.needs_decision_open,
+    `ready ${offer.summary.included_lines}, left out ${leftOut(offer).length}, ` +
+      `open ${offer.summary.needs_decision_open}`);
+  const readyLines = offer.lines.filter((l) => l.status === "included");
+  const has = (l, kind) => l.issues.some((i) => i.kind === kind);
+  const cleaned = readyLines.filter((l) => has(l, "fixed")).length;
+  const worth = readyLines.filter((l) => has(l, "warning")).length;
+  const shownCleaned = await within("fixed");
+  const shownWorth = await within("warning");
+  check(`${name}: cleaned up and worth a look count ready lines only (API)`,
+    shownCleaned === cleaned && shownWorth === worth &&
+      shownCleaned <= ready && shownWorth <= ready,
+    `${shownCleaned} cleaned up, ${shownWorth} worth a look, within ${ready} ready`);
+}
+
 const browser = await chromium.launch();
 const context = await browser.newContext({ viewport: { width: 1280, height: 940 } });
 const page = await context.newPage();
@@ -49,8 +109,20 @@ page.on("pageerror", (e) => bad("no page errors", String(e)));
 
 try {
   // ---------------------------------------------------------------- upload
-  step("1. Upload from the home page");
+  step("0. The upload page says what it takes and what happens next");
   await page.goto(`${BASE}/`);
+  await page.waitForSelector(".dropzone");
+  check("a drop zone with a file button",
+    (await page.locator(".dropzone").isVisible()) &&
+      (await page.getByRole("button", { name: "Choose a file" }).isVisible()));
+  const layoutNames = await page.locator(".layout h3").allInnerTexts();
+  check("both supported layouts are named",
+    layoutNames.join(",") === "Northstar,Harbor", layoutNames.join(", "));
+  check("three steps under 'What happens next'",
+    (await page.locator(".steps li").count()) === 3);
+  await shotFull(page, "ui-1-upload");
+
+  step("1. Upload from the home page");
   await page.setInputFiles('input[type="file"]', FIXTURE);
   await page.waitForURL(/\/offers\/.+/, { timeout: 15000 });
   const offerId = page.url().split("/offers/")[1];
@@ -79,6 +151,34 @@ try {
   );
   check("the CSV is still offered alongside it",
     (await page.locator('a[href$="/export.csv"]').count()) === 1);
+
+  step("1a. The summary panel says what was done and what is needed");
+  const lead = await page.locator(".overview-lead").innerText();
+  check("it names the file and the number of lines",
+    lead === `Read ${loaded.summary.total_lines.toLocaleString("en-US")} lines from ${loaded.source_filename}.`,
+    lead);
+  const chip = async (kind) =>
+    count(await page.locator(`.chip[data-kind="${kind}"] > b`).innerText());
+  await checkSummaryReconciles(page, loaded, "Northstar");
+  const readyNow = loaded.lines.filter((l) => l.status === "included");
+  const readyText = `${loaded.summary.included_lines} ready to go (` +
+    `${readyNow.filter((l) => l.issues.some((i) => i.kind === "fixed")).length} cleaned up automatically, ` +
+    `${readyNow.filter((l) => l.issues.some((i) => i.kind === "warning")).length} worth a look)`;
+  const readyShown = await page.locator('.chip[data-kind="ready"]').innerText();
+  check("the ready count carries its cleaned-up and worth-a-look lines inside it",
+    readyShown === readyText, readyShown);
+  if (leftOut(loaded).some((l) => l.issues.some((i) => i.code === "ZERO_QUANTITY"))) {
+    const leftOutChip = await page.locator('.chip[data-kind="left-out"]').innerText();
+    check("the reason for leaving lines out is named", leftOutChip.includes("(0 pieces)"),
+      leftOutChip);
+  }
+  const progress = await page.locator(".decisions-count").innerText();
+  check("progress starts at 0 of every question the sheet raised (API)",
+    progress.startsWith(`0 of ${asked(loaded)} decided`), progress);
+  check("the progress bar says the same",
+    (await page.locator('[role="progressbar"]').getAttribute("aria-valuenow")) === "0" &&
+      (await page.locator('[role="progressbar"]').getAttribute("aria-valuemax")) ===
+        String(asked(loaded)));
 
   step("1b. The list explains itself without expanding anything");
   await page.getByRole("tab", { name: /Excluded/ }).click();
@@ -129,6 +229,17 @@ try {
     [...new Set(badges)].join(", "));
   await page.getByRole("tab", { name: /Needs decision/ }).click();
 
+  step("1c. 'Review N decisions' opens the tab that needs them");
+  await page.getByRole("tab", { name: /All lines/ }).click();
+  const reviewButton = page.getByRole("button", { name: /^Review \d+ decisions?/ });
+  const reviewLabel = await reviewButton.innerText();
+  check("the button counts the open decisions (API)",
+    reviewLabel.startsWith(`Review ${loaded.summary.needs_decision_open} decisions`), reviewLabel);
+  await reviewButton.click();
+  check("it opens Needs decision",
+    (await page.getByRole("tab", { name: /Needs decision/ }).getAttribute("aria-selected")) ===
+      "true");
+
   // ------------------------------------------------------------ conflicts
   step("2. Resolve the conflict group with one save");
   const conflictLine = loaded.lines.find((l) =>
@@ -173,7 +284,24 @@ try {
   );
   await page.locator(".line-head", { hasText: noCost.item_code }).first().click();
   const detail = page.locator(".line", { hasText: noCost.item_code }).first();
+
+  // Include with the cost still blank: nothing may be staged; the cost is
+  // asked for on the line instead of failing at save.
+  const costInput = detail.locator('label:has-text("Supplier cost") input');
+  check("the cost starts blank, as the sheet had it", (await costInput.inputValue()) === "");
+  await detail.getByRole("button", { name: "Include", exact: true }).click();
+  const heldBack = await page.locator(".savebar-message").innerText();
+  check("Include with no cost stages nothing",
+    heldBack.includes(`${siblings.length} unsaved`) &&
+      !(await detail.evaluate((el) => el.classList.contains("is-staged"))),
+    heldBack);
+  const ask = await detail.locator(".ask").innerText();
+  check("it asks for the missing cost right there", /enter the supplier cost/.test(ask), ask);
+  check("the blank field is flagged and focused",
+    (await costInput.getAttribute("aria-invalid")) === "true" &&
+      (await costInput.evaluate((el) => el === document.activeElement)));
   await detail.locator('label:has-text("Supplier cost") input').fill("9.00");
+  check("the prompt clears once a cost is typed", (await detail.locator(".ask").count()) === 0);
   await detail.getByRole("button", { name: "Include", exact: true }).click();
   check(
     "the fix is staged",
@@ -197,6 +325,15 @@ try {
     `screen ${costAfter} / api ${afterSave.summary.supplier_cost}`,
   );
   check("one version bump for the whole batch", afterSave.version === 2, `v${afterSave.version}`);
+  const decidedNow = asked(afterSave) - afterSave.summary.needs_decision_open;
+  const progressNow = await page.locator(".decisions-count").innerText();
+  check("progress counts the saved decisions (API)",
+    progressNow.startsWith(`${decidedNow} of ${asked(afterSave)} decided`) &&
+      (await page.locator('[role="progressbar"]').getAttribute("aria-valuenow")) ===
+        String(decidedNow),
+    progressNow);
+  check("the decision chip follows the save (API)",
+    (await chip("needs")) === afterSave.summary.needs_decision_open);
 
   const siblingStates = siblings.map((id) => {
     const line = afterSave.lines.find((l) => l.line_id === id);
@@ -338,6 +475,20 @@ try {
     bigCost.replace(/[$,]/g, "") === big.summary.supplier_cost,
     bigCost,
   );
+  await checkSummaryReconciles(bigPage, big, "5,000-row file");
+
+  step("10a. The Harbor size grid: the summary reconciles there too");
+  const harborPage = await context.newPage();
+  await harborPage.goto(`${BASE}/`);
+  await harborPage.setInputFiles(
+    'input[type="file"]',
+    path.join(here, "../backend/tests/fixtures/02-harbor-size-grid.xlsx"),
+  );
+  await harborPage.waitForURL(/\/offers\/.+/, { timeout: 15000 });
+  await harborPage.waitForSelector(".overview");
+  const harbor = await api(`/api/offers/${harborPage.url().split("/offers/")[1]}`);
+  await checkSummaryReconciles(harborPage, harbor, "Harbor");
+  await harborPage.close();
 
   step("11. A rejected value comes back for editing, not lost");
   await page.getByRole("tab", { name: /All lines/ }).click();
@@ -497,6 +648,72 @@ try {
     l.issues.some((i) => i.code === "DUPLICATE_AFTER_EDIT"));
   check("both rows are flagged as possibly double-counted", dupWarn);
   await dupB.tab.close();
+
+  step("14. Every decision made: the page says it is ready to export");
+  const all = await freshOffer();
+  await shotFull(all.tab, "ui-2-fresh-offer");
+  check("export is not highlighted while decisions are open",
+    !(await all.tab.getByRole("button", { name: "Export Excel" })
+      .evaluate((el) => el.classList.contains("export-ready"))));
+
+  // A flagged value nobody changed is asked for too, not staged: -12 pieces.
+  const negative = all.data.lines.find((l) =>
+    l.issues.some((i) => i.code === "NEGATIVE_QUANTITY"));
+  if (negative) {
+    await all.tab.locator(".line-head", { hasText: negative.description }).first().click();
+    const negRow = all.tab.locator(".line", { hasText: negative.description }).first();
+    await negRow.getByRole("button", { name: "Include", exact: true }).click();
+    const negAsk = await negRow.locator(".ask").innerText();
+    check("Include on a flagged quantity asks for pieces, naming the sheet's value",
+      negAsk.includes("number of pieces") && negAsk.includes(String(negative.quantity)), negAsk);
+    check("…and stages nothing",
+      (await all.tab.locator(".savebar-message").innerText()) === "No unsaved changes");
+    await negRow.locator(".line-head").click();
+  }
+
+  // Groups by their own buttons; every other open line is excluded, so no
+  // value is typed that a person did not supply.
+  for (const card of await all.tab.locator(".group").all()) {
+    if ((await card.locator("h3").innerText()).includes("are identical")) {
+      await card.getByRole("button", { name: /Count once/ }).click();
+    } else {
+      await card.getByRole("button", { name: "Keep this one" }).first().click();
+    }
+  }
+  for (const line of all.data.lines.filter((l) =>
+    l.needs_decision_open && l.related_line_ids.length === 0)) {
+    await all.tab.locator(".line-head", { hasText: line.description }).first().click();
+    const row = all.tab.locator(".line", { hasText: line.description }).first();
+    await row.getByRole("button", { name: "Exclude", exact: true }).click();
+    await row.locator(".line-head").click();
+  }
+  const stagedAll = await all.tab.locator(".decisions-count").innerText();
+  check("chosen-but-unsaved decisions are shown as such",
+    stagedAll.includes("not saved yet"), stagedAll.replace(/\s+/g, " "));
+  await all.tab.getByRole("button", { name: "Save", exact: true }).click();
+  await all.tab.waitForSelector(".savebar.saved", { timeout: 15000 });
+
+  const allDone = await api(`/api/offers/${all.id}`);
+  check("the server agrees nothing is open", allDone.summary.needs_decision_open === 0);
+  const done = await all.tab.locator(".decisions-done").innerText();
+  check("'All decisions made — ready to export'",
+    done.includes("All decisions made — ready to export"), done);
+  check("the export button is highlighted",
+    await all.tab.getByRole("button", { name: "Export Excel" })
+      .evaluate((el) => el.classList.contains("export-ready")));
+  check("no review button once nothing is open",
+    (await all.tab.getByRole("button", { name: /^Review \d+ decision/ }).count()) === 0);
+  const leftOutChip = count(await all.tab.locator('.chip[data-kind="left-out"] > b').innerText());
+  const readyChip = count(await all.tab.locator('.chip[data-kind="ready"] > b').innerText());
+  check("summary chips still match the API",
+    readyChip === allDone.summary.included_lines &&
+      leftOutChip === leftOut(allDone).length &&
+      readyChip + leftOutChip === allDone.summary.total_lines,
+    `${readyChip} ready + ${leftOutChip} left out of ${allDone.summary.total_lines}`);
+  await checkSummaryReconciles(all.tab, allDone, "Northstar, all decided");
+  await all.tab.getByRole("tab", { name: /All lines/ }).click();
+  await shotFull(all.tab, "ui-3-all-decided");
+  await all.tab.close();
 
 } catch (error) {
   bad("script completed", String(error).split("\n")[0]);

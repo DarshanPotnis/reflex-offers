@@ -1,7 +1,7 @@
 # Handoff
 
-**Live app:** `<to be filled in after deploy>`
-**Example saved offer:** `<to be filled in after deploy>`
+**Live app:** https://reflex-offers.onrender.com
+**Example saved offer:** https://reflex-offers.onrender.com/offers/512c0e68-5d5b-489f-8ad4-fae2bdbc4d8c
 **Submitted commit:** `<to be filled in>`
 
 Source: this repository. Design and reasoning: [docs/DESIGN.md](docs/DESIGN.md).
@@ -14,25 +14,42 @@ Setup and deploy: [README.md](README.md).
 1. **Upload** a supplier line sheet on the home page. Both supplied layouts
    are recognised by column *name*, so reordered columns and title or footer
    rows are fine. Unsupported files are refused with a message naming the
-   columns we looked for.
-2. **Review.** The offer page opens on **Needs decision**. The summary shows
-   what we would pay the supplier, with the retail reference visually
-   separate and labelled "not what we pay". Tabs: Needs decision, Warnings,
-   Auto-fixed, Excluded, All lines.
+   columns we looked for. The upload page names both layouts and their
+   columns, and says in three steps what happens next.
+2. **Review.** The offer page opens with one sentence of what happened —
+   "Read 14 lines from 01-northstar-line-sheet.xlsx. 6 ready to go (3 cleaned
+   up automatically, 1 worth a look) · 1 left out (0 pieces) · 7 need your
+   decision" — whose top level always adds up to the lines read, a "0 of 7
+   decided" progress bar, and a button straight to the decisions. Below it, what we would pay the supplier, with the retail
+   reference visually separate and labelled "not what we pay". Tabs: Needs
+   decision, Worth a look, Cleaned up, Excluded, All lines. Each kind has one
+   label and one colour everywhere it appears: summary, tabs, row badges and
+   issue tags.
 3. **Understand.** Every row that is out of the totals says why, in the list
    itself — "No supplier cost", "Quantity is -12", "Duplicate of row 6".
    Expanding a row shows the original cells with their spreadsheet
    coordinates beside the cleaned values, so any line can be checked against
    the sheet. The original file is downloadable from the header.
 4. **Decide.** Fix a code, size, quantity or cost and include the line;
-   exclude it; or reset it. Conflicting rows are shown as one card — "keep
+   exclude it; or reset it. Include on a line that is missing a value it
+   needs (no cost, or the sheet's -12 unchanged) stages nothing: the field is
+   flagged and the value is asked for on the line, instead of failing at
+   save. Conflicting rows are shown as one card — "keep
    this one". Identical rows ask a different question: **count once** (the
    default) or **count both, supplier has separate lots**. Either resolves
    the whole group in a single save.
 5. **Save.** Edits are staged locally and saved together. The offer lives at
    a shareable link and reopens with every decision intact in any browser.
 6. **Export.** `.xlsx` (primary) or `.csv`. Export is blocked while anything
-   is unsaved, with the reason shown beside the button.
+   is unsaved, with the reason shown beside the button, and highlighted once
+   every decision is made and saved. The workbook opens on a Summary sheet —
+   offer link, supplier, source file, saved version, export time, totals, and
+   every line left out with its reason — and its notes are written for a file
+   read without the app.
+
+Screenshots: [the upload page](docs/screenshots/ui-1-upload.png),
+[a fresh Northstar offer](docs/screenshots/ui-2-fresh-offer.png), and
+[the same offer with every decision made](docs/screenshots/ui-3-all-decided.png).
 
 ---
 
@@ -306,13 +323,15 @@ and the entire offer JSON **byte-identical before and after — same sha256**.
 ### Tests
 
 ```
-backend:   172 passed, 6 skipped   (SQLite)
-           178 passed in 594.70s   (Neon Postgres — the 6 skips run here)
-frontend:  67 checks               (real browser, real server)
+backend:   193 passed, 6 skipped   (SQLite)
+           178 passed in 594.70s   (Neon Postgres, Phase 4 — the 6 skips run here)
+frontend:  107 checks              (real browser, real server)
 ```
 
 The six skips are threaded race tests; SQLite serialises writers so the race
-cannot occur there. The browser check reads its expectations from the API, so
+cannot occur there. The Neon run predates the last 21 tests, which cover the
+export's wording, Summary sheet and would-be value rather than storage or
+concurrency; they have run on SQLite only. The browser check reads its expectations from the API, so
 it cannot pass by agreeing with itself.
 
 ---
@@ -336,11 +355,6 @@ optimisation without a measurement is how systems get complicated.
 instance. `write_only` was tried and is a memory fix, not a speed one;
 `xlsxwriter` is the real lever. Measurements and reasoning in
 [docs/speed.md](docs/speed.md).
-
-**A conflict card shows "— total" for an excluded row's line value**, since an
-excluded line genuinely has no line value. It reads slightly oddly in a card
-whose purpose is comparing rows. Fixing it properly means the server sending a
-would-be value, because the frontend is not permitted to multiply money.
 
 **No audit trail.** Decisions are upserted, so the current state is exact but
 there is no history of who changed what and when. Not required here; it would
@@ -424,7 +438,10 @@ trap the parser exists to survive, undone at the last step; the primary export
 became `.xlsx` with the code written as a text cell. A duplicate card offering
 "keep this one" on both rows asked the wrong question entirely, since
 identical rows are a count-once-or-count-both decision. A greyed-out export
-button explained itself only in a hover tooltip, which nobody hovers.
+button explained itself only in a hover tooltip, which nobody hovers. Live
+testing on the deployed app found that Include on a line with no cost staged
+a change the server could only refuse at save; the line now asks for the
+value instead, and the browser check asserts that nothing is staged.
 
 **Reported measurements were audited for honesty.** A cross-country run showed
 2,754 ms of "evaluate", a stage that is pure CPU. It was not slow code: the

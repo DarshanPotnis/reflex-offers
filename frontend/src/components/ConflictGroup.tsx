@@ -1,4 +1,8 @@
-import { formatCount, formatUsd } from "../money";
+import { useState } from "react";
+
+import { formatCount, formatUsd, plural } from "../money";
+import { currentValues, describeGaps, FIELD_NAME, gapsFor, includeChange } from "../required";
+import type { FieldValues, RequiredField } from "../required";
 import type { Change, OfferLine } from "../types";
 
 /**
@@ -12,7 +16,19 @@ import type { Change, OfferLine } from "../types";
  *   duplicate  the numbers agree, so the only question is whether the
  *              supplier has one lot or two. Count once, or count both.
  *   conflict   the numbers disagree, so one of them is wrong. Pick one.
+ *
+ * If a row being included is missing a value it needs (a copy with no cost,
+ * say), the card asks for it in place rather than staging a save that the
+ * server could only refuse.
  */
+
+type Typed = Record<string, Partial<FieldValues>>;
+
+interface Asking {
+  lines: OfferLine[];
+  finish: (typed: Typed) => Change[];
+}
+
 export function ConflictGroup({
   members,
   staged,
@@ -22,6 +38,10 @@ export function ConflictGroup({
   staged: Record<string, Change>;
   onKeep: (changes: Change[]) => void;
 }) {
+  const [asking, setAsking] = useState<Asking | null>(null);
+  const [typed, setTyped] = useState<Typed>({});
+  const [checked, setChecked] = useState(false);
+
   const isDuplicate = members.some((line) =>
     line.issues.some(
       (issue) => issue.code === "DUPLICATE_ROW" || issue.code === "DUPLICATE_KEPT",
@@ -36,24 +56,57 @@ export function ConflictGroup({
   const headline =
     members[0].issues.find((issue) => issue.code === "CONFLICTING_ROWS")?.message ?? "";
 
-  const include = (line: OfferLine): Change => ({
-    line_id: line.line_id,
-    action: "include",
+  const valuesFor = (line: OfferLine, from: Typed): FieldValues => ({
+    ...currentValues(line),
+    ...from[line.line_id],
   });
+  // With nothing typed this is exactly { line_id, action: "include" }.
+  const include = (line: OfferLine, from: Typed): Change =>
+    includeChange(line, valuesFor(line, from));
   const exclude = (line: OfferLine): Change => ({
     line_id: line.line_id,
     action: "exclude",
   });
 
+  /** Stage now if every row to include is complete; otherwise ask first. */
+  const attempt = (toInclude: OfferLine[], finish: (from: Typed) => Change[]) => {
+    const incomplete = toInclude.filter(
+      (line) => gapsFor(line, currentValues(line)).length > 0,
+    );
+    if (incomplete.length === 0) {
+      setAsking(null);
+      onKeep(finish({}));
+      return;
+    }
+    setTyped({});
+    setChecked(false);
+    setAsking({ lines: incomplete, finish });
+  };
+
   const countOnce = () => {
     const [first, ...rest] = members;
-    onKeep([include(first), ...rest.map(exclude)]);
+    attempt([first], (from) => [include(first, from), ...rest.map(exclude)]);
   };
-  const countBoth = () => onKeep(members.map(include));
+  const countBoth = () => attempt(members, (from) => members.map((l) => include(l, from)));
   const keepOnly = (chosen: OfferLine) =>
-    onKeep(
-      members.map((line) => (line.line_id === chosen.line_id ? include(line) : exclude(line))),
+    attempt([chosen], (from) =>
+      members.map((line) =>
+        line.line_id === chosen.line_id ? include(line, from) : exclude(line),
+      ),
     );
+
+  const finishAsking = () => {
+    if (!asking) return;
+    const stillMissing = asking.lines.some(
+      (line) => gapsFor(line, valuesFor(line, typed)).length > 0,
+    );
+    if (stillMissing) {
+      setChecked(true);
+      return;
+    }
+    onKeep(asking.finish(typed));
+    setAsking(null);
+  };
 
   const stagedFor = (line: OfferLine) => staged[line.line_id];
   const allIncluded =
@@ -63,7 +116,7 @@ export function ConflictGroup({
     members.slice(1).every((line) => stagedFor(line)?.action === "exclude");
 
   return (
-    <div className="group">
+    <div className="group k-needs">
       <h3>
         {isDuplicate
           ? `${rowList} are identical`
@@ -81,6 +134,8 @@ export function ConflictGroup({
       {members.map((line) => {
         const pending = stagedFor(line);
         const chosen = pending?.action === "include";
+        // Server-computed, so an excluded row still shows what it is worth.
+        const value = line.line_value ?? line.would_be_line_value;
         return (
           <div key={line.line_id} className={`group-option${chosen ? " chosen" : ""}`}>
             <span>
@@ -88,7 +143,7 @@ export function ConflictGroup({
               <span className="muted">
                 {" "}
                 · {formatCount(line.quantity)} pieces · {formatUsd(line.unit_cost)} each ·{" "}
-                {formatUsd(line.line_value)} total
+                {value === null ? "no total" : `${formatUsd(value)} total`}
               </span>
               {line.description && <div className="tiny muted">{line.description}</div>}
             </span>
@@ -107,6 +162,56 @@ export function ConflictGroup({
           </div>
         );
       })}
+
+      {asking && (
+        <div className="ask-form">
+          {asking.lines.map((line) => {
+            const gaps = gapsFor(line, currentValues(line));
+            const open = checked ? gapsFor(line, valuesFor(line, typed)) : [];
+            return (
+              <div key={line.line_id}>
+                <p className="ask" role="alert">
+                  To include row {line.source_row}, enter {describeGaps(gaps)}.
+                  Nothing has been staged yet.
+                </p>
+                <div className="fields">
+                  {gaps.map(({ field }) => (
+                    <AskField
+                      key={field}
+                      label={`Row ${line.source_row} — ${FIELD_NAME[field]}`}
+                      field={field}
+                      value={typed[line.line_id]?.[field] ?? ""}
+                      missing={open.some((gap) => gap.field === field)}
+                      onChange={(value) =>
+                        setTyped((current) => ({
+                          ...current,
+                          [line.line_id]: { ...current[line.line_id], [field]: value },
+                        }))
+                      }
+                    />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          <div className="row wrap">
+            <button className="primary small" onClick={finishAsking}>
+              Include with{" "}
+              {plural(
+                asking.lines.reduce(
+                  (sum, line) => sum + gapsFor(line, currentValues(line)).length,
+                  0,
+                ),
+                "this value",
+                "these values",
+              )}
+            </button>
+            <button className="small" onClick={() => setAsking(null)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {isDuplicate ? (
         <>
@@ -140,5 +245,34 @@ export function ConflictGroup({
         </p>
       )}
     </div>
+  );
+}
+
+function AskField({
+  label,
+  field,
+  value,
+  missing,
+  onChange,
+}: {
+  label: string;
+  field: RequiredField;
+  value: string;
+  missing: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="ask-field">
+      {label}
+      <input
+        type="text"
+        inputMode={field === "quantity" ? "numeric" : field === "unit_cost" ? "decimal" : "text"}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        aria-invalid={missing || undefined}
+        data-missing={missing ? "" : undefined}
+        autoFocus
+      />
+    </label>
   );
 }

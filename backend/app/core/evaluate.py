@@ -355,6 +355,9 @@ class EvaluatedLine:
     unit_cost_units: int | None
     retail_units: int | None
     line_value_units: int | None
+    # What the line would add if it were included; set whether or not it is.
+    # Never summed — only ``line_value_units`` reaches a total.
+    would_be_value_units: int | None
     original: StoredLine
     cells: dict[str, StoredCell]
     issues: tuple[Issue, ...]
@@ -508,6 +511,7 @@ def evaluate(lines: list[StoredLine], decisions: list[Decision]) -> EvaluatedOff
             line_value_units=(
                 w["quantity"] * w["unit_cost_units"] if w["status"] == "included" else None
             ),
+            would_be_value_units=_would_be_value(w["quantity"], w["unit_cost_units"]),
             original=w["line"],
             cells=w["line"].cells,
             issues=tuple(w["issues"]),
@@ -524,6 +528,21 @@ def evaluate(lines: list[StoredLine], decisions: list[Decision]) -> EvaluatedOff
         for w in working
     )
     return EvaluatedOffer(evaluated, _summarise(evaluated))
+
+
+def _would_be_value(quantity: int | None, unit_cost_units: int | None) -> int | None:
+    """Pieces x cost for a line that has both, included or not.
+
+    A card comparing two conflicting rows has to show each row's value, and
+    both rows are excluded until someone picks one. The browser is not allowed
+    to multiply money, so the server sends it. Nothing is invented: a line
+    without a positive quantity and cost gets no value at all.
+    """
+    if quantity is None or unit_cost_units is None:
+        return None
+    if quantity <= 0 or unit_cost_units <= 0:
+        return None
+    return quantity * unit_cost_units
 
 
 def _flag_duplicates_after_edit(working: list[dict[str, Any]]) -> None:

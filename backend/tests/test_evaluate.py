@@ -6,6 +6,7 @@ otherwise.
 """
 
 import io
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -20,8 +21,22 @@ from app.core.evaluate import (
     store,
     validate_change,
 )
-from app.core.export import COLUMNS, escape_text, export_records, export_rows, to_csv
-from app.core.export_xlsx import COLUMN_SPEC, SHEET_NAME, read_amount, to_xlsx
+from app.core.export import (
+    COLUMNS,
+    escape_text,
+    export_records,
+    export_rows,
+    left_out_records,
+    to_csv,
+)
+from app.core.export_xlsx import (
+    COLUMN_SPEC,
+    SHEET_NAME,
+    SUMMARY_SHEET,
+    WorkbookContext,
+    read_amount,
+    to_xlsx,
+)
 from app.core.money import format_amount, to_units
 from app.core.normalize import Parsed, parse_money, parse_quantity, parse_text
 from app.core.reader import SourceCell, SourceLine, read_workbook
@@ -522,3 +537,177 @@ def test_workbook_sizes_cannot_be_read_as_dates():
     _, body, _ = read_workbook_rows(to_xlsx(offer, offer_id="o1", supplier="S"))
     assert body[0]["Size"].value == "1/2"
     assert body[0]["Size"].number_format == "@"
+
+
+# ---------- the would-be line value ----------
+
+def test_excluded_lines_carry_a_would_be_value_that_no_total_uses():
+    """A card comparing conflicting rows needs each row's value, and both rows
+    are out until someone picks. The server sends it; nothing sums it."""
+    _, lines = stored("01-northstar-line-sheet.xlsx")
+    offer = evaluate(lines, [])
+    by_id = offer.by_id()
+
+    assert by_id["R14"].line_value_units is None
+    assert by_id["R14"].would_be_value_units == 100 * to_units(Decimal("5.00"))
+    assert by_id["R15"].would_be_value_units == 100 * to_units(Decimal("5.50"))
+    # Nothing is invented where a number is missing or unusable.
+    assert by_id["R9"].would_be_value_units is None    # no supplier cost
+    assert by_id["R12"].would_be_value_units is None   # -12 pieces
+    assert by_id["R13"].would_be_value_units is None   # 0 pieces
+    assert by_id["R18"].would_be_value_units is None   # "TBD"
+
+    for line in offer.lines:
+        if line.included:
+            assert line.would_be_value_units == line.line_value_units
+    assert offer.summary.supplier_cost_units == to_units(Decimal("4208.00"))
+
+
+# ---------- notes worded for a file ----------
+
+SCREEN_WORDS = ("Enter one", "Choose which", "Include only if", "Check the original",
+                "Counted once here")
+
+
+def _decided(lines):
+    """Every kind of decision at once: pick, count once, fix, exclude."""
+    return save(
+        lines, [],
+        Change("R14", "include"), Change("R15", "exclude"),
+        Change("R6", "include"), Change("R10", "exclude"),
+        Change("R9", "include", unit_cost="9.00", note="Confirmed by phone"),
+        Change("R12", "exclude", note="Supplier to confirm"),
+        Change("R16", "include", item_code="SC-01"),
+        Change("R18", "exclude"),
+    )
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES[:2])
+def test_file_notes_carry_no_screen_instructions(name):
+    _, lines = stored(name)
+    decisions = _decided(lines) if name.startswith("01") else []
+    for offer in (evaluate(lines, []), evaluate(lines, decisions)):
+        texts = [r.notes for r in export_records(offer, offer_id="o1", supplier="S")]
+        texts += [r.reason for r in left_out_records(offer)]
+        for text in texts:
+            assert not any(word in text for word in SCREEN_WORDS), text
+            assert ".;" not in text and not text.endswith("."), text
+
+
+def test_the_stripped_instructions_really_occur_in_issue_messages():
+    """Otherwise the test above would pass by never meeting one."""
+    _, lines = stored("01-northstar-line-sheet.xlsx")
+    messages = " ".join(i.message for line in evaluate(lines, []).lines for i in line.issues)
+    for word in SCREEN_WORDS:
+        if word != "Check the original":   # LARGE_QUANTITY; no fixture has one
+            assert word in messages, word
+
+
+def test_file_notes_follow_the_saved_decisions():
+    _, lines = stored("01-northstar-line-sheet.xlsx")
+
+    def notes(*changes):
+        offer = evaluate(lines, save(lines, [], *changes))
+        return {r.source_row: r.notes for r in export_records(offer, offer_id="o1", supplier="S")}
+
+    default = notes()
+    assert default[7] == "Supplier cost: sheet had '$3.25', read as 3.25"
+    assert default[19] == "Pieces: sheet had ' 45 ', read as 45"
+    assert default[6] == "Identical to row 10, which is left out so the stock is counted once"
+
+    # Counting both makes "counted once" untrue, so it must not be said.
+    both = notes(Change("R6", "include"), Change("R10", "include"))
+    assert "counted once" not in both[6]
+    assert "also included on row(s) 10" in both[6]
+    assert both[10].endswith("Included by reviewer as a separate lot from row 6")
+
+    chosen = notes(Change("R14", "include"), Change("R15", "exclude"))
+    assert chosen[14] == "Chosen by reviewer over row 15, which had different values"
+
+    # A typed value says it was typed, and what the sheet held.
+    typed = notes(Change("R9", "include", unit_cost="9.00", note="Confirmed by phone"))
+    assert typed[9] == (
+        "Included by reviewer; Supplier cost set by reviewer to 9.00 (sheet: blank); "
+        "Reviewer's note: Confirmed by phone"
+    )
+
+
+# ---------- the Summary sheet ----------
+
+def read_summary(data: bytes):
+    """The Summary sheet as {label: cell} plus the left-out table rows."""
+    book = load_workbook(io.BytesIO(data))
+    assert book.sheetnames == [SUMMARY_SHEET, SHEET_NAME]
+    rows = list(book[SUMMARY_SHEET].iter_rows())
+    labels = {row[0].value: row[1] for row in rows if isinstance(row[0].value, str)}
+    start = next(
+        (i for i, row in enumerate(rows) if row[0].value == "Why it was left out"), None
+    )
+    table = [] if start is None else [
+        [c.value for c in row] for row in rows[start + 1:] if row[0].value is not None
+    ]
+    return labels, table
+
+
+def test_summary_sheet_says_what_the_file_is():
+    _, lines = stored("01-northstar-line-sheet.xlsx")
+    offer = evaluate(lines, save(lines, [], Change("R12", "exclude", note="Supplier to confirm")))
+    url = "https://offers.example/offers/offer-1"
+    labels, table = read_summary(to_xlsx(
+        offer, offer_id="offer-1", supplier="Northstar Supply",
+        context=WorkbookContext(
+            offer_url=url, source_filename="01-northstar-line-sheet.xlsx",
+            sheet_name="Line Sheet", version=2,
+            exported_at=datetime(2026, 9, 22, 14, 3, tzinfo=timezone.utc),
+        ),
+    ))
+    summary = offer.summary
+
+    assert labels["Offer link"].value == url
+    assert labels["Offer link"].hyperlink.target == url
+    assert labels["Offer ID"].value == "offer-1"
+    assert labels["Supplier"].value == "Northstar Supply"
+    assert labels["Source file"].value == "01-northstar-line-sheet.xlsx"
+    assert labels["Saved version"].value == 2
+    assert labels["Exported at"].value == "2026-09-22 14:03 UTC"
+
+    assert labels["Lines included"].value == summary.included_lines
+    assert labels["Pieces"].value == summary.pieces
+    assert labels["Pieces"].number_format == "#,##0"
+    assert to_units(read_amount(labels["Supplier cost total"].value)) == summary.supplier_cost_units
+    assert to_units(read_amount(
+        labels["Retail reference total (not what we pay)"].value
+    )) == summary.retail_reference_units
+    assert labels["Lines left out"].value == summary.total_lines - summary.included_lines
+
+    # Every line out of the totals is listed, once, with its reason.
+    reasons = {row[1]: row[0] for row in table}
+    assert sorted(reasons) == sorted(l.source_row for l in offer.lines if not l.included)
+    assert reasons[12] == "Excluded by reviewer: Supplier to confirm"
+    assert reasons[9] == "Awaiting a decision: No supplier cost"
+    assert reasons[13] == "0 pieces available"
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_summary_sheet_totals_equal_the_summary(name):
+    result, lines = stored(name)
+    offer = evaluate(lines, [])
+    labels, table = read_summary(to_xlsx(offer, offer_id="o1", supplier=result.supplier_name))
+    summary = offer.summary
+
+    assert labels["Pieces"].value == summary.pieces
+    assert to_units(read_amount(labels["Supplier cost total"].value)) == summary.supplier_cost_units
+    assert labels["Lines left out"].value == len(table) == summary.total_lines - summary.included_lines
+    if not table:
+        assert "None: every line in the sheet is included." in labels
+
+
+def test_offer_id_lives_on_the_summary_not_on_every_row():
+    assert "Offer ID" not in [label for _, label, _, _ in COLUMN_SPEC]
+
+
+def test_pieces_are_formatted_as_counts():
+    _, lines = stored("01-northstar-line-sheet.xlsx")
+    _, body, _ = read_workbook_rows(to_xlsx(evaluate(lines, []), offer_id="o1", supplier="S"))
+    assert body and all(row["Pieces"].number_format == "#,##0" for row in body)
+    assert all(row["Source row"].number_format == "General" for row in body)

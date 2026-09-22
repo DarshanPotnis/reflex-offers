@@ -36,7 +36,7 @@ Or entirely from the terminal, which is what produced the output below.
 
 ## What the user sees
 
-### 1. Before — a saved offer at v3
+### 1. Before — a saved offer at v2
 
 ![Before the failure](screenshots/failure-1-before.png)
 

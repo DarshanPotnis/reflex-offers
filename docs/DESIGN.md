@@ -274,6 +274,14 @@ leading apostrophe, covering `=`, `+`, `-`, `@`, tab and carriage return.
 decimal string. A spreadsheet's numeric cell is an IEEE double by definition,
 so the workbook is a rendering, not the source of truth.
 
+**The workbook explains itself.** It opens on a Summary sheet — offer link,
+supplier, source file, the saved version it was built from and when, the
+totals, and every line left out with its reason — so a file forwarded on its
+own still says what it is. Notes are worded for a file rather than the
+screen: no "enter one to include this line", no "counted once" after both
+copies were counted, and any value a reviewer typed says so, beside what the
+sheet held.
+
 ---
 
 ## 8. Assumptions

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -23,7 +24,7 @@ from sqlalchemy.orm import Session
 from . import service
 from .core.evaluate import Change, EvaluatedLine, EvaluatedOffer, Summary
 from .core.export import to_csv
-from .core.export_xlsx import to_xlsx
+from .core.export_xlsx import WorkbookContext, to_xlsx
 from .core.money import format_amount
 from .db import get_session
 from .models import Offer, TEXT_FIELDS, NUMBER_FIELDS
@@ -147,6 +148,9 @@ def line_json(line: EvaluatedLine) -> dict[str, Any]:
         "unit_cost": _amount(line.unit_cost_units),
         "retail": _amount(line.retail_units),
         "line_value": _amount(line.line_value_units),
+        # Pieces x cost even while excluded, so a card comparing rows never
+        # has to multiply money in the browser. Not part of any total.
+        "would_be_line_value": _amount(line.would_be_value_units),
         "original": original,
         "cells": {
             name: {"coordinate": cell.coordinate, "raw": cell.raw}
@@ -334,7 +338,19 @@ XLSX_MEDIA_TYPE = (
 )
 
 
-def _export(session: Session, offer_id: str, suffix: str) -> Response:
+def _public_origin(request: Request) -> str:
+    """The origin the user's browser reached, for a link written into a file.
+
+    Render terminates TLS at its proxy, so the app itself sees plain http; the
+    proxy's X-Forwarded-Proto says what the user actually used. This only
+    shapes a link in the requester's own download.
+    """
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("host") or request.url.netloc
+    return f"{proto.split(',')[0].strip()}://{host}"
+
+
+def _export(session: Session, request: Request, offer_id: str, suffix: str) -> Response:
     timings = service.Timings()
     try:
         offer, evaluated = service.load_evaluated(session, offer_id, timings)
@@ -342,7 +358,18 @@ def _export(session: Session, offer_id: str, suffix: str) -> Response:
         raise _http(404, "No offer with that id.") from exc
     with timings.stage("serialize"):
         if suffix == "xlsx":
-            data = to_xlsx(evaluated, offer_id=offer.id, supplier=offer.supplier_name)
+            data = to_xlsx(
+                evaluated,
+                offer_id=offer.id,
+                supplier=offer.supplier_name,
+                context=WorkbookContext(
+                    offer_url=f"{_public_origin(request)}/offers/{offer.id}",
+                    source_filename=offer.source_filename,
+                    sheet_name=offer.sheet_name,
+                    version=offer.version,
+                    exported_at=datetime.now(timezone.utc),
+                ),
+            )
             media_type = XLSX_MEDIA_TYPE
         else:
             data = to_csv(evaluated, offer_id=offer.id, supplier=offer.supplier_name)
@@ -358,15 +385,15 @@ def _export(session: Session, offer_id: str, suffix: str) -> Response:
 
 
 @router.get("/offers/{offer_id}/export.xlsx")
-def export_offer_xlsx(offer_id: str, session: SessionDep) -> Response:
+def export_offer_xlsx(offer_id: str, request: Request, session: SessionDep) -> Response:
     """The one the UI links to: Excel keeps 000101 a code, not the number 101."""
-    return _export(session, offer_id, "xlsx")
+    return _export(session, request, offer_id, "xlsx")
 
 
 @router.get("/offers/{offer_id}/export.csv")
-def export_offer_csv(offer_id: str, session: SessionDep) -> Response:
+def export_offer_csv(offer_id: str, request: Request, session: SessionDep) -> Response:
     """Kept for imports and for byte-exact decimal amounts."""
-    return _export(session, offer_id, "csv")
+    return _export(session, request, offer_id, "csv")
 
 
 @router.get("/offers/{offer_id}/source")

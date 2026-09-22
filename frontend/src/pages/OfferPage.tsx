@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { exportCsvUrl, exportUrl, getConfig, sourceUrl } from "../api";
@@ -6,9 +6,11 @@ import { ConflictGroup } from "../components/ConflictGroup";
 import { FaultToggle } from "../components/FaultToggle";
 import { LineList } from "../components/LineList";
 import { NoticesPanel } from "../components/NoticesPanel";
+import { OfferOverview } from "../components/OfferOverview";
 import { SaveBar } from "../components/SaveBar";
 import { SummaryPanel } from "../components/SummaryPanel";
 import { useOfferWorkspace } from "../hooks/useOfferWorkspace";
+import { KIND, wasAskedAbout } from "../kinds";
 import { formatCount, plural } from "../money";
 import type { Change, OfferLine } from "../types";
 
@@ -17,8 +19,8 @@ type TabId = "needs" | "warnings" | "fixed" | "excluded" | "all";
 const TAB_INTRO: Record<TabId, string> = {
   needs: "Left out until you decide. Nothing here is counted in the totals.",
   warnings: "Counted, but worth a look before you send this on.",
-  fixed: "Read differently from the sheet, with the meaning unchanged. Every change is shown and reversible.",
-  excluded: "Everything currently out of the totals, and why.",
+  fixed: "Cleaned up automatically: written differently in the sheet, with the meaning unchanged. Every change is shown and reversible.",
+  excluded: "Everything currently out of the totals, and why: lines left out, and lines waiting for your decision.",
   all: "Every line the sheet produced.",
 };
 
@@ -31,6 +33,7 @@ export function OfferPage() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [faultAvailable, setFaultAvailable] = useState(false);
   const [faultArmed, setFaultArmed] = useState(false);
+  const tabsRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     getConfig()
@@ -83,6 +86,11 @@ export function OfferPage() {
 
   const stageGroup = (changes: Change[]) => workspace.stage(...changes);
 
+  const review = () => {
+    setTab("needs");
+    tabsRef.current?.scrollIntoView({ block: "start" });
+  };
+
   const handleSave = () => {
     const armed = faultArmed;
     setFaultArmed(false); // one-shot: the retry must be able to succeed
@@ -105,13 +113,21 @@ export function OfferPage() {
     );
   }
 
-  const tabs: { id: TabId; label: string; count: number }[] = [
-    { id: "needs", label: "Needs decision", count: buckets.needs.length },
-    { id: "warnings", label: "Warnings", count: buckets.warnings.length },
-    { id: "fixed", label: "Auto-fixed", count: buckets.fixed.length },
+  // Tabs for a kind carry its label and colour; Excluded and All lines are
+  // views across kinds, so they stay neutral.
+  const tabs: { id: TabId; label: string; count: number; kind?: string }[] = [
+    { id: "needs", label: KIND.needs_decision.label, count: buckets.needs.length,
+      kind: KIND.needs_decision.className },
+    { id: "warnings", label: KIND.warning.label, count: buckets.warnings.length,
+      kind: KIND.warning.className },
+    { id: "fixed", label: KIND.fixed.label, count: buckets.fixed.length,
+      kind: KIND.fixed.className },
     { id: "excluded", label: "Excluded", count: buckets.excluded.length },
     { id: "all", label: "All lines", count: buckets.all.length },
   ];
+
+  // Saved state only: with edits pending, the file would not match the screen.
+  const readyToExport = offer.summary.needs_decision_open === 0 && !workspace.hasUnsaved;
 
   return (
     <div className="page">
@@ -144,7 +160,9 @@ export function OfferPage() {
           ) : (
             <>
               <a href={exportUrl(offer.id)}>
-                <button className="primary">Export Excel</button>
+                <button className={`primary${readyToExport ? " export-ready" : ""}`}>
+                  Export Excel
+                </button>
               </a>
               <a className="tiny" href={exportCsvUrl(offer.id)}>
                 CSV
@@ -154,17 +172,25 @@ export function OfferPage() {
         </div>
       </div>
 
+      <OfferOverview
+        offer={offer}
+        linesById={linesById}
+        staged={staged}
+        hasUnsaved={workspace.hasUnsaved}
+        onReview={review}
+      />
       <SummaryPanel summary={offer.summary} />
       <NoticesPanel notices={offer.notices} />
       {faultAvailable && (
         <FaultToggle armed={faultArmed} onChange={setFaultArmed} />
       )}
 
-      <div className="tabs" role="tablist">
+      <div className="tabs" role="tablist" ref={tabsRef}>
         {tabs.map((entry) => (
           <button
             key={entry.id}
             role="tab"
+            className={entry.kind}
             aria-selected={tab === entry.id}
             onClick={() => setTab(entry.id)}
           >
@@ -199,7 +225,9 @@ export function OfferPage() {
               empty={
                 groups.length > 0
                   ? "Nothing else needs a decision."
-                  : "Nothing needs a decision — this sheet read cleanly."
+                  : offer.lines.some(wasAskedAbout)
+                    ? "Every decision is made. Excluded lists what was left out and why."
+                    : "Nothing needs a decision — this sheet read cleanly."
               }
             />
           </>

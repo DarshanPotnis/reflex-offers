@@ -24,11 +24,18 @@ artifact for anything that needs to be byte-exact.
 
 **Retail is labelled.** Two columns, both saying "reference only", so a retail
 figure can never be mistaken for what we pay.
+
+A **Summary** sheet comes first, so a file forwarded on its own still says
+what it is: the offer link, supplier, source file, the saved version it was
+built from and when, the totals, and every line left out with its reason.
+The offer id lives there rather than repeated down 5,000 rows.
 """
 
 from __future__ import annotations
 
 import io
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -38,20 +45,20 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 from .evaluate import EvaluatedOffer
-from .export import ExportRecord, export_records
+from .export import ExportRecord, export_records, left_out_records
 from .money import to_decimal
 
 SHEET_NAME = "Offer"
+SUMMARY_SHEET = "Summary"
 
 # (field, header, kind, width)
 COLUMN_SPEC: tuple[tuple[str, str, str, int], ...] = (
-    ("offer_id", "Offer ID", "text", 38),
     ("supplier", "Supplier", "text", 20),
     ("item_code", "Item code", "code", 14),
     ("description", "Description", "text", 30),
     ("size", "Size", "code", 10),
     ("category", "Category", "text", 14),
-    ("quantity", "Pieces", "int", 10),
+    ("quantity", "Pieces", "count", 10),
     ("unit_cost_usd", "Supplier cost / piece", "money", 18),
     ("line_value_usd", "Line value", "money", 14),
     ("retail_unit_usd", "Retail / piece (reference only)", "money", 26),
@@ -62,11 +69,30 @@ COLUMN_SPEC: tuple[tuple[str, str, str, int], ...] = (
 
 # At least two decimals, up to four, so a $0.0125 cost is not shown as $0.01.
 MONEY_FORMAT = '"$"#,##0.00##'
+COUNT_FORMAT = "#,##0"
+
+# Summary sheet: labels in A; the left-out table spans A-G beneath them.
+SUMMARY_WIDTHS = (40, 16, 14, 10, 30, 10, 20)
+LEFT_OUT_HEADERS = (
+    "Why it was left out", "Source row", "Item code", "Size", "Description",
+    "Pieces", "Supplier cost / piece",
+)
+
+
+@dataclass(frozen=True)
+class WorkbookContext:
+    """Where the file came from, for the Summary sheet. Supplied by the API:
+    the core never reads the clock or the request."""
+
+    offer_url: str | None = None
+    source_filename: str | None = None
+    sheet_name: str | None = None
+    version: int | None = None
+    exported_at: datetime | None = None
 
 
 def _values(record: ExportRecord) -> dict[str, object]:
     return {
-        "offer_id": record.offer_id,
         "supplier": record.supplier,
         "item_code": record.item_code,
         "description": record.description,
@@ -103,14 +129,106 @@ def _money_cell(sheet: Any, units: int) -> Any:
     return cell
 
 
-def to_xlsx(offer: EvaluatedOffer, *, offer_id: str, supplier: str | None) -> bytes:
-    """Included lines only, from saved state. No totals row.
+def _count_cell(sheet: Any, value: int) -> Any:
+    cell = WriteOnlyCell(sheet, value=value)
+    cell.number_format = COUNT_FORMAT
+    return cell
+
+
+def _bold(sheet: Any, text: str, size: int | None = None) -> Any:
+    cell = WriteOnlyCell(sheet, value=text)
+    cell.data_type = "s"
+    cell.font = Font(bold=True, size=size) if size else Font(bold=True)
+    return cell
+
+
+def _write_summary(
+    sheet: Any,
+    offer: EvaluatedOffer,
+    *,
+    offer_id: str,
+    supplier: str | None,
+    context: WorkbookContext,
+) -> None:
+    for index, width in enumerate(SUMMARY_WIDTHS, start=1):
+        sheet.column_dimensions[get_column_letter(index)].width = width
+
+    def text(value: str | None, *, as_code: bool = False) -> Any:
+        return _text_cell(sheet, value, as_code=as_code) if value else None
+
+    link = text(context.offer_url)
+    if link is not None:
+        link.hyperlink = context.offer_url
+
+    exported = (
+        context.exported_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if context.exported_at else None
+    )
+    summary = offer.summary
+    left_out = left_out_records(offer)
+
+    sheet.append([_bold(sheet, "Supplier offer", size=14)])
+    sheet.append([])
+    sheet.append(["Offer link", link])
+    sheet.append(["Offer ID", text(offer_id)])
+    sheet.append(["Supplier", text(supplier)])
+    sheet.append(["Source file", text(context.source_filename)])
+    sheet.append(["Sheet read", text(context.sheet_name)])
+    sheet.append(["Saved version", context.version])
+    sheet.append(["Exported at", text(exported)])
+    sheet.append([])
+    sheet.append([_bold(sheet, "Totals (included lines only)")])
+    sheet.append(["Lines included", _count_cell(sheet, summary.included_lines)])
+    sheet.append(["Pieces", _count_cell(sheet, summary.pieces)])
+    sheet.append(["Supplier cost total", _money_cell(sheet, summary.supplier_cost_units)])
+    sheet.append([
+        "Retail reference total (not what we pay)",
+        _money_cell(sheet, summary.retail_reference_units),
+    ])
+    sheet.append(["Lines left out", _count_cell(sheet, len(left_out))])
+    sheet.append([])
+    sheet.append([_bold(sheet, "Lines left out, and why")])
+    if not left_out:
+        sheet.append(["None: every line in the sheet is included."])
+        return
+    sheet.append([_bold(sheet, label) for label in LEFT_OUT_HEADERS])
+    wrapped = Alignment(vertical="top", wrap_text=True)
+    for record in left_out:
+        reason = _text_cell(sheet, record.reason, as_code=False)
+        reason.alignment = wrapped
+        sheet.append([
+            reason,
+            record.source_row,
+            text(record.item_code, as_code=True),
+            text(record.size, as_code=True),
+            text(record.description),
+            None if record.quantity is None else _count_cell(sheet, record.quantity),
+            None if record.unit_cost_units is None else _money_cell(sheet, record.unit_cost_units),
+        ])
+
+
+def to_xlsx(
+    offer: EvaluatedOffer,
+    *,
+    offer_id: str,
+    supplier: str | None,
+    context: WorkbookContext | None = None,
+) -> bytes:
+    """A Summary sheet, then the included lines from saved state. No totals row
+    on the lines sheet; the totals are on the Summary.
 
     Written in openpyxl's `write_only` mode: rows are streamed straight to the
     sheet instead of being held as 5,000 rows of live Cell objects. The normal
     API spent ~3 s of a deployed request building that object graph.
     """
     workbook = Workbook(write_only=True)
+    _write_summary(
+        workbook.create_sheet(SUMMARY_SHEET),
+        offer,
+        offer_id=offer_id,
+        supplier=supplier,
+        context=context or WorkbookContext(),
+    )
     sheet = workbook.create_sheet(SHEET_NAME)
 
     # Both have to be set before any row is appended.
@@ -137,6 +255,8 @@ def to_xlsx(offer: EvaluatedOffer, *, offer_id: str, supplier: str | None) -> by
             value = values[field]
             if kind == "money":
                 row.append(None if value is None else _money_cell(sheet, value))  # type: ignore[arg-type]
+            elif kind == "count":
+                row.append(_count_cell(sheet, value))  # type: ignore[arg-type]
             elif kind == "int":
                 row.append(value)
             else:

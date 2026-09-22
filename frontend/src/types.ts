@@ -50,6 +50,8 @@ export interface OfferLine {
   unit_cost: string | null;
   retail: string | null;
   line_value: string | null;
+  /** Pieces x cost even while excluded, computed by the server. Never a total. */
+  would_be_line_value: string | null;
   original: Record<string, ParsedValue>;
   cells: Record<string, SourceCell>;
   issues: Issue[];

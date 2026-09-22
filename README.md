@@ -7,8 +7,8 @@ shows exactly what it changed and what it could not decide, lets an operations
 person fix or exclude the questionable rows, and saves the result at a
 shareable link with a clean export that always matches the screen.
 
-**Live app:** `<to be filled in after deploy>`
-**Example saved offer:** `<to be filled in after deploy>`
+**Live app:** https://reflex-offers.onrender.com
+**Example saved offer:** https://reflex-offers.onrender.com/offers/512c0e68-5d5b-489f-8ad4-fae2bdbc4d8c
 
 ## What it does
 
@@ -26,8 +26,9 @@ shareable link with a clean export that always matches the screen.
   ten-thousandths of a dollar. No float touches a price, anywhere.
 - **Survives a failed save.** A save that commits but fails to reach the
   browser can be retried without doubling anything, even after a page refresh.
-- **Exports what you see.** `.xlsx` (item code `000101` stays `000101`) and
-  `.csv`, both built from the same saved state as the screen.
+- **Exports what you see.** `.xlsx` (item code `000101` stays `000101`; a
+  Summary sheet links back to the saved offer and lists every line left out
+  and why) and `.csv`, both built from the same saved state as the screen.
 
 Design and decisions: [docs/DESIGN.md](docs/DESIGN.md) ·
 Handoff: [HANDOFF.md](HANDOFF.md) ·

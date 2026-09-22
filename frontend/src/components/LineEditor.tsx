@@ -1,5 +1,8 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import type { RefObject } from "react";
 
+import { describeGaps, gapsFor, includeChange } from "../required";
+import type { FieldValues, RequiredField } from "../required";
 import type { Change, OfferLine } from "../types";
 
 /**
@@ -9,9 +12,11 @@ import type { Change, OfferLine } from "../types";
  * fields the user actually changed are sent as overrides, so the original
  * parse stays visible and a reset really does restore the default.
  *
- * Nothing is validated here beyond "did you type something". The server is
- * the validator, and its messages are what get shown — a second, looser copy
- * of the rules in the browser is how the two drift apart.
+ * Nothing is validated here beyond "is there something to send" (see
+ * required.ts). The server is the validator, and its messages are what get
+ * shown — a second, looser copy of the rules in the browser is how the two
+ * drift apart. What is caught here is an include that could only be refused:
+ * rather than stage it and fail at save, ask for the value right here.
  */
 export function LineEditor({
   line,
@@ -33,27 +38,40 @@ export function LineEditor({
   );
   const [unitCost, setUnitCost] = useState(staged?.unit_cost ?? line.unit_cost ?? "");
   const [note, setNote] = useState(staged?.note ?? line.decision?.note ?? "");
+  // Set once Include was refused for a missing value; the prompt then
+  // follows what is typed and disappears when nothing is missing.
+  const [asked, setAsked] = useState(false);
+
+  const inputs: Record<RequiredField, RefObject<HTMLInputElement | null>> = {
+    item_code: useRef<HTMLInputElement>(null),
+    size: useRef<HTMLInputElement>(null),
+    quantity: useRef<HTMLInputElement>(null),
+    unit_cost: useRef<HTMLInputElement>(null),
+  };
+  const values: FieldValues = { item_code: itemCode, size, quantity, unit_cost: unitCost };
+  const gaps = asked ? gapsFor(line, values) : [];
+  const askId = `ask-${line.line_id}`;
+  const missing = (field: RequiredField) => gaps.some((gap) => gap.field === field);
+  const flag = (field: RequiredField) =>
+    missing(field)
+      ? { "aria-invalid": true as const, "aria-describedby": askId, "data-missing": "" }
+      : {};
 
   const include = () => {
-    const change: Change = { line_id: line.line_id, action: "include" };
-    if (itemCode.trim() !== (line.item_code ?? "")) change.item_code = itemCode.trim();
-    if (size.trim() !== (line.size ?? "")) change.size = size.trim();
-    if (quantity.trim() !== (line.quantity?.toString() ?? "")) {
-      // Sent only when it is a whole number; anything else goes as-is so the
-      // server can explain what is wrong with it in its own words.
-      const whole = /^-?\d+$/.test(quantity.trim());
-      change.quantity = whole
-        ? Number.parseInt(quantity.trim(), 10)
-        : (quantity.trim() as unknown as number);
+    const blocking = gapsFor(line, values);
+    if (blocking.length > 0) {
+      setAsked(true);
+      inputs[blocking[0].field].current?.focus();
+      return;
     }
-    if (unitCost.trim() !== (line.unit_cost ?? "")) change.unit_cost = unitCost.trim();
-    if (note.trim()) change.note = note.trim();
-    onStage(change);
+    setAsked(false);
+    onStage(includeChange(line, values, note));
   };
 
   const exclude = () => {
     const change: Change = { line_id: line.line_id, action: "exclude" };
     if (note.trim()) change.note = note.trim();
+    setAsked(false);
     onStage(change);
   };
 
@@ -67,42 +85,57 @@ export function LineEditor({
         </ul>
       )}
 
+      {gaps.length > 0 && (
+        <p className="ask" id={askId} role="alert">
+          To include this line, enter {describeGaps(gaps)}. Nothing has been
+          staged yet.
+        </p>
+      )}
+
       <div className="fields">
         <label>
           Item code
           <input
+            ref={inputs.item_code}
             type="text"
             value={itemCode}
             onChange={(e) => setItemCode(e.target.value)}
+            {...flag("item_code")}
           />
         </label>
         <label>
           Size
           <input
+            ref={inputs.size}
             type="text"
             className="narrow"
             value={size}
             onChange={(e) => setSize(e.target.value)}
+            {...flag("size")}
           />
         </label>
         <label>
           Pieces
           <input
+            ref={inputs.quantity}
             type="text"
             inputMode="numeric"
             className="narrow"
             value={quantity}
             onChange={(e) => setQuantity(e.target.value)}
+            {...flag("quantity")}
           />
         </label>
         <label>
           Supplier cost (USD)
           <input
+            ref={inputs.unit_cost}
             type="text"
             inputMode="decimal"
             className="narrow"
             value={unitCost}
             onChange={(e) => setUnitCost(e.target.value)}
+            {...flag("unit_cost")}
           />
         </label>
         <label style={{ flex: 1, minWidth: 190 }}>

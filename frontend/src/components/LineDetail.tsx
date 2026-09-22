@@ -87,7 +87,14 @@ export function LineDetail({
               <tr>
                 <td>Line value</td>
                 <td className="num">
-                  <strong>{formatUsd(line.line_value)}</strong>
+                  {line.line_value === null && line.would_be_line_value !== null ? (
+                    // Server-computed; shown so a held-back line can be weighed.
+                    <span className="muted">
+                      — not counted (would be {formatUsd(line.would_be_line_value)})
+                    </span>
+                  ) : (
+                    <strong>{formatUsd(line.line_value)}</strong>
+                  )}
                 </td>
               </tr>
               <tr>

@@ -1,3 +1,4 @@
+import { hasKind, isLeftOut, KIND, READY } from "../kinds";
 import { formatCount, formatUsd } from "../money";
 import { lineReason } from "../reason";
 import type { Change, OfferLine } from "../types";
@@ -39,14 +40,12 @@ export function LineRow({
 }) {
   // Why a line is out of the totals, readable without expanding anything.
   const reason = lineReason(line, linesById);
-  const autoExcluded =
-    !line.needs_decision_open &&
-    line.issues.some((issue) => issue.kind === "auto_excluded");
+  const leftOut = isLeftOut(line);
 
   const classes = [
     "line",
     line.status === "excluded" ? "is-excluded" : "",
-    autoExcluded ? "is-auto-excluded" : "",
+    leftOut ? "is-left-out" : "",
     staged ? "is-staged" : "",
     errors.length > 0 ? "has-error" : "",
   ]
@@ -68,6 +67,20 @@ export function LineRow({
         <span>
           <span className="line-desc">{line.description}</span>
           {reason && <span className="line-reason">{reason}</span>}
+          {(hasKind(line, "fixed") || hasKind(line, "warning")) && (
+            <span className="line-tags">
+              {hasKind(line, "fixed") && (
+                <span className={`tag ${KIND.fixed.className}`}>
+                  {KIND.fixed.label.toLowerCase()}
+                </span>
+              )}
+              {hasKind(line, "warning") && (
+                <span className={`tag ${KIND.warning.className}`}>
+                  {KIND.warning.label.toLowerCase()}
+                </span>
+              )}
+            </span>
+          )}
         </span>
         <span className="hide-narrow">{line.size}</span>
         <span className="num hide-narrow right">
@@ -83,9 +96,17 @@ export function LineRow({
               {staged.action === "reset" ? "reset" : staged.action} — unsaved
             </span>
           ) : line.needs_decision_open ? (
-            <span className="pill needs">needs decision</span>
+            <span className={`pill needs ${KIND.needs_decision.className}`}>
+              {KIND.needs_decision.label.toLowerCase()}
+            </span>
+          ) : leftOut ? (
+            <span className={`pill excluded ${KIND.auto_excluded.className}`}>
+              {KIND.auto_excluded.label.toLowerCase()}
+            </span>
           ) : (
-            <span className={`pill ${line.status}`}>{line.status}</span>
+            <span className={`pill included ${READY.className}`}>
+              {READY.label.toLowerCase()}
+            </span>
           )}
         </span>
       </button>

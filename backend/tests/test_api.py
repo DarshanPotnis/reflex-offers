@@ -74,8 +74,21 @@ def test_money_is_never_a_float_in_json(client):
 
     assert isinstance(body["summary"]["supplier_cost"], str)
     for line in body["lines"]:
-        for field in ("unit_cost", "retail", "line_value"):
+        for field in ("unit_cost", "retail", "line_value", "would_be_line_value"):
             assert line[field] is None or isinstance(line[field], str)
+
+
+def test_excluded_rows_carry_a_would_be_value_that_totals_ignore(client):
+    """So a conflict card can compare the rows without the browser doing sums."""
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
+    body = client.get(f"/api/offers/{offer_id}").json()
+    lines = {ln["line_id"]: ln for ln in body["lines"]}
+
+    assert lines["R14"]["line_value"] is None
+    assert lines["R14"]["would_be_line_value"] == "500.00"
+    assert lines["R15"]["would_be_line_value"] == "550.00"
+    assert lines["R9"]["would_be_line_value"] is None   # no cost: nothing invented
+    assert body["summary"]["supplier_cost"] == "4208.00"
 
 
 def test_lines_carry_the_original_cells_for_checking_against_the_sheet(client):
@@ -620,6 +633,39 @@ def test_both_export_formats_carry_the_same_numbers(client):
 
     assert csv_pieces == xlsx_pieces
     assert len(rows) - 1 == len(csv_rows) - 1
+
+
+def test_workbook_summary_links_back_to_the_saved_offer(client):
+    """A forwarded file still says what it is and which saved version it shows."""
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["offer_id"]
+    assert save(client, offer_id, [{"line_id": "R14", "action": "include"}]).status_code == 200
+    body = client.get(f"/api/offers/{offer_id}").json()
+
+    # As Render's proxy sends it: TLS ends there, so the app itself sees http.
+    data = client.get(
+        f"/api/offers/{offer_id}/export.xlsx",
+        headers={"X-Forwarded-Proto": "https", "Host": "offers.example.com"},
+    ).content
+    book = load_workbook(io.BytesIO(data))
+    assert book.sheetnames == ["Summary", "Offer"]
+    labels = {
+        row[0].value: row[1].value
+        for row in book["Summary"].iter_rows()
+        if isinstance(row[0].value, str)
+    }
+
+    assert labels["Offer link"] == f"https://offers.example.com/offers/{offer_id}"
+    assert labels["Offer ID"] == offer_id
+    assert labels["Saved version"] == body["version"] == 2
+    assert labels["Source file"] == "01-northstar-line-sheet.xlsx"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC", labels["Exported at"])
+    summary = body["summary"]
+    assert labels["Pieces"] == summary["pieces"]
+    assert to_units(read_amount(labels["Supplier cost total"])) == to_units(
+        Decimal(summary["supplier_cost"])
+    )
+    assert labels["Lines left out"] == summary["total_lines"] - summary["included_lines"]
+    assert "Offer ID" not in [c.value for c in next(book["Offer"].iter_rows())]
 
 
 def test_workbook_for_an_unknown_offer_is_404(client):
