@@ -11,3 +11,6 @@ frontend/dist/
 .DS_Store
 .idea/
 .vscode/
+
+# built frontend, produced by `npm run build`
+backend/static/

@@ -215,8 +215,11 @@ def _cost_override(raw: Any) -> tuple[int | None, list[str]]:
         ]
     parsed = parse_money(raw)
     if not parsed.usable or parsed.value is None:
-        detail = f" {parsed.note}." if parsed.note else ""
-        return None, [f"Supplier cost {raw!r} isn't an amount we can read.{detail}"]
+        # parse_money's note for unreadable text just restates the problem;
+        # say what to type instead. Its precision note does add something.
+        note = parsed.note or ""
+        detail = f"{note}." if "decimal places" in note else 'Use a decimal like "4.50".'
+        return None, [f"Supplier cost {raw!r} isn't an amount we can read. {detail}"]
     try:
         return to_units(parsed.value), []
     except MoneyPrecisionError as exc:  # parse_money already guards this

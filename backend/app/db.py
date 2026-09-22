@@ -11,9 +11,19 @@ import os
 from collections.abc import Iterator
 
 from sqlalchemy import Engine, create_engine
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 DEFAULT_DATABASE_URL = "sqlite:///./reflex_offers.db"
+
+_UNSET_HINT = (
+    "If it belongs to another project, unset it before starting this one:\n"
+    "    unset DATABASE_URL"
+)
+
+
+class ConfigurationError(RuntimeError):
+    """DATABASE_URL is set to something we cannot use."""
 
 
 class Base(DeclarativeBase):
@@ -24,10 +34,53 @@ def database_url() -> str:
     return os.environ.get("DATABASE_URL") or DEFAULT_DATABASE_URL
 
 
+def validate_database_url(url: str) -> URL:
+    """Turn a bad DATABASE_URL into advice rather than a traceback.
+
+    A JDBC url is the usual culprit: the same database spelled for a
+    different ecosystem, often exported globally by some other project. The
+    failure otherwise surfaces deep inside SQLAlchemy, where it looks like
+    our bug rather than a stray environment variable.
+    """
+    if not url.strip():
+        raise ConfigurationError(
+            "DATABASE_URL is set but empty.\n"
+            f"Unset it to use the default ({DEFAULT_DATABASE_URL}), or give a "
+            "SQLAlchemy url."
+        )
+    if url.startswith("jdbc:"):
+        equivalent = url[len("jdbc:"):]
+        if equivalent.startswith("postgresql:"):
+            equivalent = "postgresql+psycopg:" + equivalent[len("postgresql:"):]
+        raise ConfigurationError(
+            f"DATABASE_URL is a JDBC url, which SQLAlchemy can't read:\n"
+            f"    {url}\n"
+            f"For the same database, this app needs:\n"
+            f"    {equivalent}\n"
+            f"{_UNSET_HINT}"
+        )
+    try:
+        parsed = make_url(url)
+    except Exception as exc:
+        raise ConfigurationError(
+            f"DATABASE_URL isn't a SQLAlchemy url:\n    {url}\n"
+            "Expected something like sqlite:///./reflex_offers.db or "
+            "postgresql+psycopg://user:password@host/dbname.\n"
+            f"{_UNSET_HINT}"
+        ) from exc
+    if parsed.drivername == "postgres":
+        raise ConfigurationError(
+            f"DATABASE_URL uses the old 'postgres://' scheme that SQLAlchemy "
+            f"dropped:\n    {url}\n"
+            "Use postgresql+psycopg:// instead."
+        )
+    return parsed
+
+
 def make_engine(url: str | None = None) -> Engine:
-    url = url or database_url()
+    parsed = validate_database_url(url or database_url())
     kwargs: dict = {"pool_pre_ping": True}
-    if url.startswith("sqlite"):
+    if parsed.drivername.startswith("sqlite"):
         kwargs["connect_args"] = {
             # Wait for the write lock instead of failing with "database is
             # locked" when two saves land at once.
@@ -35,7 +88,7 @@ def make_engine(url: str | None = None) -> Engine:
             # TestClient and uvicorn both hand connections between threads.
             "check_same_thread": False,
         }
-    return create_engine(url, **kwargs)
+    return create_engine(parsed, **kwargs)
 
 
 def make_session_factory(engine: Engine) -> sessionmaker[Session]:

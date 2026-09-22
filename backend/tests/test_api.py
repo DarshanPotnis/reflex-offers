@@ -4,13 +4,17 @@ Two things are being proved here: the answer key survives a round trip
 through the database, and saved work cannot be lost or doubled.
 """
 
+import io
 import re
 import uuid
+from contextlib import contextmanager
 from decimal import Decimal
 
 import pytest
+from openpyxl import load_workbook
 
 from app import service
+from app.core.export_xlsx import read_amount
 from app.core.money import to_units
 from app.models import DecisionRow, Offer, SaveRequest
 from tests.conftest import fixture_bytes, run_together, upload
@@ -553,3 +557,160 @@ def test_export_reflects_saved_decisions(client):
     assert sum(
         int(r.split(",")[header.index("quantity")]) for r in rows[1:]
     ) == summary["pieces"] == 1_833
+
+
+# ---------- the workbook endpoint ----------
+
+@pytest.mark.parametrize("name, layout, lines, pieces, cost, retail", ANSWER_KEY)
+def test_workbook_export_agrees_with_the_screen(client, name, layout, lines, pieces, cost, retail):
+    offer_id = upload(client, name).json()["id"]
+    summary = client.get(f"/api/offers/{offer_id}").json()["summary"]
+
+    response = client.get(f"/api/offers/{offer_id}/export.xlsx")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(
+        "application/vnd.openxmlformats"
+    )
+    assert response.content[:2] == b"PK"  # a real zip, i.e. a real xlsx
+    assert response.headers["content-disposition"].endswith('.xlsx"')
+
+    book = load_workbook(io.BytesIO(response.content))
+    sheet = book["Offer"]
+    rows = list(sheet.iter_rows(values_only=True))
+    header = list(rows[0])
+    body = rows[1:]
+
+    assert len(body) == summary["included_lines"] == lines
+    quantity = header.index("Pieces")
+    value = header.index("Line value")
+    assert sum(r[quantity] for r in body) == summary["pieces"] == pieces
+    assert sum(
+        to_units(read_amount(r[value])) for r in body
+    ) == to_units(Decimal(summary["supplier_cost"]))
+
+
+def test_workbook_keeps_item_codes_as_text(client):
+    """Downloaded and reopened, 000101 is still 000101 and not 101."""
+    offer_id = upload(client, "01-northstar-line-sheet.xlsx").json()["id"]
+    data = client.get(f"/api/offers/{offer_id}/export.xlsx").content
+
+    sheet = load_workbook(io.BytesIO(data))["Offer"]
+    header = [c.value for c in next(sheet.iter_rows())]
+    column = header.index("Item code") + 1
+    codes = [sheet.cell(row=r, column=column) for r in range(2, sheet.max_row + 1)]
+
+    assert any(cell.value == "000101" for cell in codes)
+    assert all(isinstance(cell.value, str) for cell in codes)
+
+
+def test_both_export_formats_carry_the_same_numbers(client):
+    offer_id = upload(client, "02-harbor-size-grid.xlsx").json()["id"]
+
+    csv_rows = client.get(f"/api/offers/{offer_id}/export.csv").content.decode(
+        "utf-8-sig"
+    ).strip().split("\r\n")
+    csv_header = csv_rows[0].split(",")
+    csv_pieces = sum(int(r.split(",")[csv_header.index("quantity")]) for r in csv_rows[1:])
+
+    sheet = load_workbook(
+        io.BytesIO(client.get(f"/api/offers/{offer_id}/export.xlsx").content)
+    )["Offer"]
+    rows = list(sheet.iter_rows(values_only=True))
+    xlsx_pieces = sum(r[list(rows[0]).index("Pieces")] for r in rows[1:])
+
+    assert csv_pieces == xlsx_pieces
+    assert len(rows) - 1 == len(csv_rows) - 1
+
+
+def test_workbook_for_an_unknown_offer_is_404(client):
+    assert client.get(f"/api/offers/{uuid.uuid4()}/export.xlsx").status_code == 404
+
+
+# ---------- how the 5,000 lines actually reach the database ----------
+
+def test_five_thousand_lines_are_inserted_in_batches(client, db):
+    """One executemany, not one round trip per line.
+
+    On SQLite the difference is milliseconds. Over a network it is the
+    difference between one round trip and five thousand, so this is asserted
+    directly rather than inferred from a stopwatch.
+    """
+    from sqlalchemy import event
+
+    executions: list[tuple[str, bool, int]] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        verb = statement.strip().split(None, 1)[0].upper()
+        rows = len(parameters) if executemany and parameters else 1
+        executions.append((verb, executemany, rows))
+
+    event.listen(db, "before_cursor_execute", record)
+    try:
+        response = upload(client, "03-northstar-5000-rows.xlsx")
+    finally:
+        event.remove(db, "before_cursor_execute", record)
+
+    assert response.status_code == 201
+    offer_id = response.json()["id"]
+    assert client.get(f"/api/offers/{offer_id}").json()["summary"]["included_lines"] == 5_000
+
+    inserts = [e for e in executions if e[0] == "INSERT"]
+    rows_inserted = sum(rows for _, _, rows in inserts)
+    assert rows_inserted >= 5_000, f"only {rows_inserted} rows inserted"
+    # The whole upload is a handful of statements, not thousands.
+    assert len(inserts) < 25, (
+        f"{len(inserts)} INSERT round trips for 5,000 lines — "
+        "the bulk insert has regressed to one statement per row"
+    )
+    print(
+        f"\n  5,000 lines -> {len(inserts)} INSERT statement(s), "
+        f"{rows_inserted} rows, {len(executions)} statements in total"
+    )
+
+
+# ---------- Server-Timing must not blame CPU for network ----------
+
+def test_no_sql_runs_inside_the_evaluate_stage(client, db, monkeypatch):
+    """`evaluate` is pure CPU, and the header has to keep saying so.
+
+    This regressed once: the upload path called load_evaluated() without
+    passing its Timings, so re-reading all 5,000 stored lines landed inside
+    the caller's `evaluate` stage. On SQLite that hid in the noise; over a
+    cross-country Postgres link it showed up as 2.7 seconds of CPU that was
+    really network.
+    """
+    from sqlalchemy import event
+
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement.strip().split(None, 1)[0].upper())
+
+    sql_during: dict[str, int] = {}
+
+    class WatchedTimings(service.Timings):
+        @contextmanager
+        def stage(self, name):
+            before = len(statements)
+            with super().stage(name):
+                yield
+            sql_during[name] = sql_during.get(name, 0) + (len(statements) - before)
+
+    monkeypatch.setattr(service, "Timings", WatchedTimings)
+    event.listen(db, "before_cursor_execute", record)
+    try:
+        offer_id = upload(client, "03-northstar-5000-rows.xlsx").json()["id"]
+        client.get(f"/api/offers/{offer_id}")
+        client.get(f"/api/offers/{offer_id}/export.xlsx")
+        client.get(f"/api/offers/{offer_id}/export.csv")
+    finally:
+        event.remove(db, "before_cursor_execute", record)
+
+    assert sql_during.get("evaluate", 0) == 0, (
+        f"{sql_during['evaluate']} SQL statement(s) ran inside the evaluate "
+        f"stage; it is supposed to be pure CPU. Stages: {sql_during}"
+    )
+    assert sql_during.get("parse", 0) == 0
+    assert sql_during.get("serialize", 0) == 0
+    # And the reads really are being counted somewhere.
+    assert sql_during.get("db", 0) >= 4, sql_during

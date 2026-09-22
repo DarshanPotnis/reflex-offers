@@ -4,22 +4,31 @@ Work sample for Reflex Sales Group. Upload a supplier line sheet, review what it
 means, resolve questionable rows, save an offer at a shareable link, and export
 a clean CSV.
 
-Status: parsing engine, evaluation, storage and API complete and tested.
-Frontend is next. See `CLAUDE.md` for the full design and `PROMPTS.md` for the
-remaining build phases.
+Status: parsing engine, evaluation, storage, API and frontend complete and
+tested. Evidence and deploy are next. See `CLAUDE.md` for the full design and
+`PROMPTS.md` for the remaining build phases.
 
 ## Run it
 
 ```bash
-cd backend
+cd frontend && npm install && npm run build   # builds into backend/static/
+cd ../backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest -q                       # 141 passed, 6 skipped
-uvicorn app.main:app --reload             # http://localhost:8000
+python -m pytest -q                            # 141 passed, 6 skipped
+uvicorn app.main:app --reload                  # http://localhost:8000
 ```
+
+For frontend work, `cd frontend && npm run dev` runs Vite on :5173 and
+proxies `/api` to :8000.
 
 `python` must be 3.14. Without a `DATABASE_URL` the app creates
 `backend/reflex_offers.db` (SQLite) in the working directory.
+
+If your shell exports a `DATABASE_URL` for some other project, unset it for
+this one — `env -u DATABASE_URL uvicorn app.main:app`. A URL the app can't use
+(a `jdbc:` one, say) stops startup with an explanation rather than a
+traceback.
 
 ## Environment variables
 

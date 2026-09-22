@@ -49,11 +49,19 @@ never promote a duplicate to a conflict.
 
 ## Current state (verified — do not regress)
 
-`backend/app/core/` and the whole backend API are done, covered by
-`test_core.py`, `test_evaluate.py` and `test_api.py` (141 passing, 6 skipped
-— the skips are the threaded race tests, which only mean anything on
-Postgres). Run `cd backend && python -m pytest -q` before and after every
-change.
+`backend/` and `frontend/` are both done. Backend: `test_core.py`,
+`test_evaluate.py`, `test_api.py` — 141 passing, 6 skipped (the skips are the
+threaded race tests, meaningful only on Postgres; 147 pass on Neon). Run
+`cd backend && python -m pytest -q` before and after every change.
+
+The frontend is checked by driving a real browser:
+`cd frontend && node uicheck.mjs http://localhost:PORT` against a server
+started with `FAULT_INJECTION=1` — 39 checks covering upload, the conflict
+group, save, the fault toggle, a refresh mid-failure, retry, 422, the
+two-window 409, persistence in a fresh session, export, and virtualization.
+Its expectations are read from the API so it cannot pass by agreeing with
+itself. It needs `npm i --no-save playwright && npx playwright install
+chromium` (deliberately not a saved dependency).
 
 SQLAlchemy is pinned at **2.0.54**, not 2.0.36: the older pin cannot resolve
 `Mapped[str | None]` on Python 3.14 and fails at import.
@@ -104,7 +112,9 @@ backend/   FastAPI, SQLAlchemy 2, Postgres (prod) / SQLite (dev, tests)
   app/core/export.py     done: CSV rows from evaluated lines
   app/db.py, app/models.py, app/service.py, app/api.py, app/main.py  (done)
     service.py is the only module that commits; api.py computes nothing
-frontend/  React + TypeScript + Vite, served by FastAPI as static files
+frontend/  React + TypeScript + Vite (done). `npm run build` emits straight
+           into backend/static/, which FastAPI serves with an index.html
+           fallback. uicheck.mjs drives it in a real browser.
 ```
 
 One deployable service (Render web service + Neon Postgres). One URL.
@@ -199,8 +209,11 @@ All money in JSON is a **string** decimal (`"4.50"`). Pydantic models use
      `IntegrityError`, roll back, and return the stored receipt.
 
   Only the referenced `line_id`s are loaded for validation, never all 5,000.
-- `GET /api/offers/{id}/export.csv` — from saved state.
+- `GET /api/offers/{id}/export.xlsx` — from saved state; the UI's download.
+- `GET /api/offers/{id}/export.csv` — same rows, exact decimal strings.
 - `GET /api/offers/{id}/source` — original uploaded file.
+- `GET /api/config` — `{fault_injection: bool}`, so the UI can show the test
+  toggle only where it is enabled. (`/api/health` stays the deploy check.)
 
 ### Server-side validation for `include`
 
@@ -247,17 +260,42 @@ the same `request_id` must return the stored result and must not re-apply.
 
 ## Export (CSV)
 
-Included lines only, from saved state. Columns: `offer_id, supplier,
-item_code, description, size, category, quantity, unit_cost_usd,
-line_value_usd, retail_reference_usd, source_row, notes`. Money via
-`money.format_amount`. `notes` is the line's fixed notes, then its warnings,
-then the user's note, joined by `"; "`.
+Two formats, both built from the same `export_records()` so they cannot
+drift apart. Included lines only, from saved state, no totals row.
 
-Prefix text cells starting with `=`, `+`, `-`, `@`, tab or carriage return
-with `'` (spreadsheet formula injection — tab and CR are DDE vectors Excel
-honours just like `=`). UTF-8 with BOM so Excel opens it cleanly. No totals
-row. A test must prove: sum of `line_value_usd` == summary cost total, and
-sum of `quantity` == summary pieces.
+Fields: `offer_id, supplier, item_code, description, size, category,
+quantity, unit_cost_usd, line_value_usd, retail_unit_usd, retail_line_usd,
+source_row, notes`. Retail is **two explicit columns**: a single "retail
+reference" next to the unit cost reads like a unit price when it is the line
+total. `notes` is the line's fixed notes, then its warnings, then the user's
+note, joined by `"; "`.
+
+**`export.xlsx` is the primary download and what the UI button links to.**
+Excel reads a CSV column of digits as a number, so `000101` opens as `101` —
+the exact trap the parser exists to survive, undone at the last step. In the
+workbook the item code is a **text cell** (`data_type "s"`, number format
+`@`) and stays `000101`; size is text too, so `1/2` is not read as a date.
+Money is numeric with format `"$"#,##0.00##` (2–4 decimals, so a $0.0125 cost
+isn't shown as $0.01) so the columns can be summed. Headers are human labels,
+and both retail ones say "reference only".
+
+openpyxl turns a string starting with `=` into a **formula**, so every text
+cell is forced back to `data_type = "s"` after assignment — written as an
+inline string, no apostrophe needed.
+
+**`export.csv` stays** for imports and as the byte-exact artifact: it writes
+every amount as its exact decimal string. A spreadsheet's numeric cell is an
+IEEE double by definition, and openpyxl serialises with `"%.16g" %`, which
+coerces a `Decimal` through float (`Decimal("999999.9999")` lands as
+`999999.9999000001`). Our code never builds a float — it hands openpyxl the
+exact `Decimal` from `money.to_decimal` — and a test reads the workbook back
+and checks every amount against the summary. CSV text cells are still
+prefixed with `'` when they start with `=`, `+`, `-`, `@`, tab or carriage
+return; UTF-8 with BOM.
+
+Tests must prove, for **both** formats: sum of line values == summary cost
+total, sum of quantity == summary pieces, and `000101` survives the workbook
+as text.
 
 ## Frontend behaviour
 
@@ -275,14 +313,53 @@ sum of `quantity` == summary pieces.
   `related_line_ids`, so the whole group resolves in a single version bump.
   Resolving a group must never leave a sibling sitting in Needs decision —
   including row 14 of an A108 conflict has to close row 15 in the same save.
-- Edits are staged locally. A bar shows "N unsaved changes · Save". States:
-  saving; saved (vN); **failed -> "Not saved. Your changes are still here. Retry"**
-  (retry reuses the same `request_id`; a new id is generated only after a
-  confirmed success); **409 -> "Changed in another window. Reload latest"**,
-  offering to re-apply the unsaved changes on top.
+- Tabs are filters, not a partition: a line can appear in several. **Excluded
+  lists everything currently out of the totals**, including lines still
+  awaiting a decision, each with its reason — "what was left out and why" has
+  one honest answer in one place.
+- **Every value on screen comes from the API.** No sample data, no hardcoded
+  item codes, costs or cell references anywhere in the frontend.
+
+### Saving: three pieces of state, never conflated
+
+| | Holds |
+| --- | --- |
+| `staged` | edits made but not submitted |
+| `inFlight` | `{requestId, changes}` — the exact batch being saved or failed |
+| `status` | `idle · saving · saved(vN) · failed · conflict` |
+
+A bar shows "N unsaved changes · Save". Then:
+
+- **saving -> 200**: refetch the offer *before* reporting success, so totals
+  and lines always come from one response; then `staged` clears and the
+  `requestId` is discarded. A new id is minted only after a confirmed success.
+- **failed** (5xx/network) -> "Not saved. Your changes are still here. Retry".
+  Retry resends `inFlight` byte-identically — a changed body would hit the
+  server's "request_id reused with different changes" 422. Editing stays
+  allowed, but **while status is failed the only save action is Retry**;
+  new edits collect in `staged` and become the next batch only once the
+  retry succeeds.
+- **422** -> move `inFlight` back into `staged`, show each message against
+  its line, and **discard the `requestId`**: the body will change once the
+  user fixes the values, so the id must not be reused.
+- **409** -> "Changed in another window. Reload latest", then offer to
+  re-apply. Before re-applying, compare each pending line's decision in the
+  freshly loaded offer against its decision in the snapshot the user was
+  working from. Lines another window changed are **listed by name and need
+  confirmation before being overwritten**; unaffected lines re-apply
+  directly. Re-applying mints a **new** `requestId` (new base version, new
+  body, genuinely a new save).
+- `staged`, `inFlight` and the `requestId` are persisted in `sessionStorage`
+  keyed by offer id, so a refresh during a failed save can still Retry with
+  the same `requestId`. A `beforeunload` warning fires while anything is
+  unsaved.
 - Export is disabled while there are unsaved changes ("save first so the file
   matches what's saved").
 - 5,000 lines: virtualize the All-lines list; don't render hidden rows.
+- When `/api/config` reports fault injection on, show a clearly labelled
+  "Test mode: fail next save (after commit)" toggle. It is **one-shot** —
+  it arms the next save only and then disarms, so the retry succeeds and the
+  recovery is actually demonstrable. Invisible when the flag is off.
 
 ## Evidence the brief requires (deliver all)
 
@@ -330,6 +407,13 @@ commissions, deal management, new file formats, AI-based parsing of values.
   fixtures drop every table; pointing them at a real database would be
   unrecoverable. SQLite connects with `timeout=30` so the threaded tests wait
   for the write lock instead of failing with "database is locked".
+- **`DATABASE_URL` is validated before use** (`validate_database_url` in
+  `db.py`). A `jdbc:` url, the retired `postgres://` scheme or anything
+  unparseable stops startup with advice — including how to translate it and
+  `unset DATABASE_URL` — instead of a traceback from inside SQLAlchemy. This
+  matters because a global `DATABASE_URL` exported by an unrelated project is
+  inherited by every command here: **run the server and any measurements with
+  `env -u DATABASE_URL`**, and set `DATABASE_URL` explicitly only for Neon.
 - Prefer creating new files over large rewrites of working ones.
 - Brute-force-simple first; optimize only with a measurement showing why.
 - Explain architecture before implementing anything non-trivial, then build.

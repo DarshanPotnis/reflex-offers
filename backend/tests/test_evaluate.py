@@ -20,7 +20,8 @@ from app.core.evaluate import (
     store,
     validate_change,
 )
-from app.core.export import COLUMNS, escape_text, export_rows, to_csv
+from app.core.export import COLUMNS, escape_text, export_records, export_rows, to_csv
+from app.core.export_xlsx import COLUMN_SPEC, SHEET_NAME, read_amount, to_xlsx
 from app.core.money import format_amount, to_units
 from app.core.normalize import Parsed, parse_money, parse_quantity, parse_text
 from app.core.reader import SourceCell, SourceLine, read_workbook
@@ -267,13 +268,25 @@ def test_export_sums_equal_the_summary(name):
 
     quantity = header.index("quantity")
     value = header.index("line_value_usd")
-    retail = header.index("retail_reference_usd")
+    unit_cost = header.index("unit_cost_usd")
+    retail_unit = header.index("retail_unit_usd")
+    retail_line = header.index("retail_line_usd")
 
     assert sum(int(r[quantity]) for r in body) == offer.summary.pieces
     assert sum(to_units(Decimal(r[value])) for r in body) == offer.summary.supplier_cost_units
     assert sum(
-        to_units(Decimal(r[retail])) for r in body if r[retail]
+        to_units(Decimal(r[retail_line])) for r in body if r[retail_line]
     ) == offer.summary.retail_reference_units
+
+    # The retail columns say which is which: unit x pieces == line.
+    for row in body:
+        assert to_units(Decimal(row[value])) == int(row[quantity]) * to_units(
+            Decimal(row[unit_cost])
+        )
+        if row[retail_unit]:
+            assert to_units(Decimal(row[retail_line])) == int(row[quantity]) * to_units(
+                Decimal(row[retail_unit])
+            )
 
 
 def test_export_carries_decisions_and_their_notes():
@@ -409,3 +422,103 @@ def test_evaluate_returns_the_same_totals_when_run_twice():
     first: EvaluatedOffer = evaluate(lines, decisions)
     second: EvaluatedOffer = evaluate(lines, decisions)
     assert first.summary == second.summary
+
+
+# ---------- the workbook ----------
+
+def read_workbook_rows(data: bytes):
+    """Header labels plus each row as a dict keyed by column label."""
+    book = load_workbook(io.BytesIO(data))
+    sheet = book[SHEET_NAME]
+    rows = list(sheet.iter_rows(values_only=False))
+    headers = [c.value for c in rows[0]]
+    body = [{headers[i]: cell for i, cell in enumerate(row)} for row in rows[1:]]
+    return headers, body, sheet
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_workbook_sums_equal_the_summary(name):
+    result, lines = stored(name)
+    offer = evaluate(lines, [])
+    headers, body, _ = read_workbook_rows(
+        to_xlsx(offer, offer_id="offer-1", supplier=result.supplier_name)
+    )
+
+    assert headers == [label for _, label, _, _ in COLUMN_SPEC]
+    assert len(body) == offer.summary.included_lines
+
+    pieces = sum(row["Pieces"].value for row in body)
+    cost = sum(to_units(read_amount(row["Line value"].value)) for row in body)
+    retail = sum(
+        to_units(read_amount(row["Retail line (reference only)"].value))
+        for row in body
+        if row["Retail line (reference only)"].value is not None
+    )
+    assert pieces == offer.summary.pieces
+    assert cost == offer.summary.supplier_cost_units
+    assert retail == offer.summary.retail_reference_units
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_every_workbook_amount_survives_the_round_trip(name):
+    """A spreadsheet number is a double; check that costs us nothing here."""
+    result, lines = stored(name)
+    offer = evaluate(lines, [])
+    records = {
+        (r.item_code, r.size, r.source_row): r
+        for r in export_records(offer, offer_id="o1", supplier=result.supplier_name)
+    }
+    _, body, _ = read_workbook_rows(
+        to_xlsx(offer, offer_id="o1", supplier=result.supplier_name)
+    )
+    for row in body:
+        key = (row["Item code"].value, row["Size"].value, row["Source row"].value)
+        record = records[key]
+        assert to_units(read_amount(row["Supplier cost / piece"].value)) == record.unit_cost_units
+        assert to_units(read_amount(row["Line value"].value)) == record.line_value_units
+
+
+def test_leading_zeros_survive_the_workbook():
+    """The trap this whole app exists to survive, at the last step: Excel
+    reads a CSV column of digits as a number and 000101 opens as 101."""
+    _, lines = stored("01-northstar-line-sheet.xlsx")
+    offer = evaluate(lines, [])
+    _, body, _ = read_workbook_rows(to_xlsx(offer, offer_id="o1", supplier="Northstar"))
+
+    coded = [row["Item code"] for row in body if row["Item code"].value == "000101"]
+    assert coded, "000101 is not in the export at all"
+    for cell in coded:
+        assert isinstance(cell.value, str)      # not the number 101
+        assert cell.data_type == "s"
+        assert cell.number_format == "@"
+
+
+def test_workbook_never_writes_a_live_formula():
+    lines = synthetic(("A100", "M", 10, "3.00"), description='=HYPERLINK("http://evil","click")')
+    offer = evaluate(lines, [])
+    _, body, _ = read_workbook_rows(
+        to_xlsx(offer, offer_id="o1", supplier="=cmd|'/c calc'!A1")
+    )
+    row = body[0]
+    for label in ("Description", "Supplier"):
+        assert row[label].data_type == "s", f"{label} became a formula"
+        # Written literally, so no apostrophe is needed to defuse it.
+        assert not str(row[label].value).startswith("'")
+    assert row["Description"].value.startswith("=HYPERLINK")
+    assert row["Pieces"].value == 10           # numbers stay numbers
+
+
+def test_workbook_labels_retail_as_reference():
+    labels = [label for _, label, _, _ in COLUMN_SPEC]
+    retail = [label for label in labels if "Retail" in label]
+    assert len(retail) == 2
+    assert all("reference only" in label for label in retail)
+
+
+def test_workbook_sizes_cannot_be_read_as_dates():
+    """A size of 1/2 is a size, not the first of February."""
+    lines = synthetic(("A100", "1/2", 10, "3.00"))
+    offer = evaluate(lines, [])
+    _, body, _ = read_workbook_rows(to_xlsx(offer, offer_id="o1", supplier="S"))
+    assert body[0]["Size"].value == "1/2"
+    assert body[0]["Size"].number_format == "@"

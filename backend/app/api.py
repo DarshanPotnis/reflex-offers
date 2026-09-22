@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from . import service
 from .core.evaluate import Change, EvaluatedLine, EvaluatedOffer, Summary
 from .core.export import to_csv
+from .core.export_xlsx import to_xlsx
 from .core.money import format_amount
 from .db import get_session
 from .models import Offer, TEXT_FIELDS, NUMBER_FIELDS
@@ -238,14 +239,27 @@ async def upload_offer(
             offer_id=exc.existing_id,
         ) from exc
 
-    with timings.stage("evaluate"):
-        _, evaluated = service.load_evaluated(session, offer.id)
+    # Pass `timings` in: load_evaluated re-reads every stored line, and
+    # without this that read lands inside the caller's `evaluate` stage and
+    # blames CPU for what is network. It cost 2.7 s of mislabelled time on a
+    # cross-country Neon link before anyone noticed.
+    _, evaluated = service.load_evaluated(session, offer.id, timings)
     with timings.stage("serialize"):
         body = offer_json(offer, evaluated)
 
     response.status_code = 200 if replayed else 201
     response.headers["Server-Timing"] = timings.header()
     return body
+
+
+@router.get("/config")
+def read_config() -> dict[str, Any]:
+    """What the UI needs to know about this deployment.
+
+    The test-mode toggle is rendered only when this says so, which is what
+    keeps it out of production.
+    """
+    return {"fault_injection": fault_injection_enabled()}
 
 
 @router.get("/offers")
@@ -319,23 +333,44 @@ def save_decisions(
     return receipt
 
 
-@router.get("/offers/{offer_id}/export.csv")
-def export_offer(offer_id: str, session: SessionDep) -> Response:
+XLSX_MEDIA_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+
+def _export(session: Session, offer_id: str, suffix: str) -> Response:
     timings = service.Timings()
     try:
         offer, evaluated = service.load_evaluated(session, offer_id, timings)
     except service.OfferNotFound as exc:
         raise _http(404, "No offer with that id.") from exc
     with timings.stage("serialize"):
-        data = to_csv(evaluated, offer_id=offer.id, supplier=offer.supplier_name)
+        if suffix == "xlsx":
+            data = to_xlsx(evaluated, offer_id=offer.id, supplier=offer.supplier_name)
+            media_type = XLSX_MEDIA_TYPE
+        else:
+            data = to_csv(evaluated, offer_id=offer.id, supplier=offer.supplier_name)
+            media_type = "text/csv; charset=utf-8"
     return Response(
         content=data,
-        media_type="text/csv; charset=utf-8",
+        media_type=media_type,
         headers={
-            "Content-Disposition": f'attachment; filename="offer-{offer.id}.csv"',
+            "Content-Disposition": f'attachment; filename="offer-{offer.id}.{suffix}"',
             "Server-Timing": timings.header(),
         },
     )
+
+
+@router.get("/offers/{offer_id}/export.xlsx")
+def export_offer_xlsx(offer_id: str, session: SessionDep) -> Response:
+    """The one the UI links to: Excel keeps 000101 a code, not the number 101."""
+    return _export(session, offer_id, "xlsx")
+
+
+@router.get("/offers/{offer_id}/export.csv")
+def export_offer_csv(offer_id: str, session: SessionDep) -> Response:
+    """Kept for imports and for byte-exact decimal amounts."""
+    return _export(session, offer_id, "csv")
 
 
 @router.get("/offers/{offer_id}/source")

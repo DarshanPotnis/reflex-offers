@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Engine
 
 from .api import register_handlers, router
-from .db import create_tables, get_engine
+from .db import ConfigurationError, create_tables, get_engine
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -23,10 +25,24 @@ def create_app(engine: Engine | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        create_tables(engine or get_engine())
+        try:
+            create_tables(engine or get_engine())
+        except ConfigurationError as exc:
+            # Advice, not a stack trace: this is someone's environment, not a
+            # bug in the app. os._exit rather than SystemExit because the ASGI
+            # server catches exceptions raised in a lifespan hook and prints
+            # its own traceback on top, which is the thing we are avoiding.
+            print(f"\nCan't start the app.\n\n{exc}\n", file=sys.stderr, flush=True)
+            sys.stderr.flush()
+            os._exit(1)
         yield
 
     app = FastAPI(title="Reflex supplier offer tool", lifespan=lifespan)
+    # The 5,000-row offer serialises to ~5.7 MB of JSON and the workflow
+    # fetches it three times. Level 6 rather than 9: the last few percent of
+    # ratio costs more CPU than it saves on the wire. Measured before/after
+    # in docs/speed.md; the totals are identical either way.
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
     register_handlers(app)
     app.include_router(router)
 
