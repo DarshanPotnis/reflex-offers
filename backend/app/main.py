@@ -47,7 +47,9 @@ def create_app(engine: Engine | None = None) -> FastAPI:
     register_handlers(app)
     app.include_router(router)
 
-    @app.get("/api/health")
+    # HEAD as well as GET: uptime monitors and Render's own probes send HEAD,
+    # and FastAPI does not add it automatically the way plain Starlette does.
+    @app.api_route("/api/health", methods=["GET", "HEAD"])
     def health() -> dict[str, object]:
         # The CPU quota is here so every measurement records the hardware it
         # ran on. A plan change that silently did not apply is otherwise
@@ -73,7 +75,7 @@ def _serve_frontend(app: FastAPI) -> None:
 
     index = FRONTEND_DIR / "index.html"
 
-    @app.get("/{full_path:path}", include_in_schema=False)
+    @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     def spa(full_path: str) -> FileResponse:
         candidate = FRONTEND_DIR / full_path
         if full_path and candidate.is_file():

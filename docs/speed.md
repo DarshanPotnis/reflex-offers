@@ -447,10 +447,150 @@ Also worth knowing: two workers at 0.5 CPU take **more than 7 seconds to
 finish starting**. The container `HEALTHCHECK` allows a 20-second start
 period; anything stricter would report a healthy service as failed.
 
-> **Render Starter measurement: pending.** Same script, no code change, so the
-> only variable is the instance size. `render.yaml` now carries
-> `plan: starter`, and `measure.py` prints the CPU quota reported by
-> `/api/health` in its header — so the next table states its own hardware.
+### Render **Starter** + Neon, both in Ohio — hardware verified
+
+Same script, same code, only the instance size changed. The header confirmed
+the plan actually applied this time, and that Render set **1 worker**.
+
+_host: 0.5 vCPU · host reports 16 cores (cgroup v2) · 1 worker(s) · fault
+injection on_
+
+| Step | First run | Repeat (median) | Wire | Uncompressed | Server-Timing (first run) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| upload (parse + store) | 4129 ms | 4156 ms | 63 B | same | parse 1634, analyze 272, db 1491 |
+| GET offer (review-ready) | 2393 ms | 2417 ms | 383 kB (gzip) | 5.73 MB | db 584, evaluate 480, serialize 264 |
+| save one decision | 385 ms | 176 ms | 127 B (gzip) | same | db 116 |
+| re-fetch after save | 2512 ms | 2441 ms | 383 kB (gzip) | 5.73 MB | db 527, evaluate 494, serialize 492 |
+| export .xlsx | 4179 ms | 4416 ms | 252 kB (gzip) | 297 kB | db 325, evaluate 505, serialize 3055 |
+| export .csv | 1656 ms | 1492 ms | 80 kB (gzip) | 647 kB | db 353, evaluate 867, serialize 240 |
+| **Whole workflow** | **15254 ms** | **15099 ms** | | | |
+
+**Whole workflow 36.7 s → 15.3 s, a 2.4× improvement with no code change.**
+
+| Step | Free | Starter | |
+| --- | ---: | ---: | ---: |
+| upload | 10223 ms | 4129 ms | 2.5× |
+| GET offer | 5518 ms | 2393 ms | 2.3× |
+| save one decision | 146 ms | 385 ms | **0.4×** |
+| re-fetch | 6163 ms | 2512 ms | 2.5× |
+| export .xlsx | 10581 ms | 4179 ms | 2.5× |
+| export .csv | 4057 ms | 1656 ms | 2.4× |
+| **Whole workflow** | **36688 ms** | **15254 ms** | **2.4×** |
+
+A 5× nominal CPU quota (0.1 → 0.5 vCPU) returned ~2.4×. The likely reason is
+that **Free was never really held to 0.1 vCPU**: burstable instances are
+generally allowed to exceed their nominal share when the host is idle, so the
+Free numbers flattered it and the real gap between the plans is smaller than
+the quotas imply. Worth stating rather than quietly claiming 5×.
+
+**The save is the one step that got worse** — 146 → 385 ms first run, 124 →
+176 ms repeat, with its `db` stage going 51 → 116 ms. It is 7 statements
+moving 510 bytes, so it is pure round-trip time to Neon and has nothing to do
+with instance CPU. With one sample per configuration and Neon's free tier able
+to suspend an idle database, this is more likely connection warm-up or
+database-side variance than a real regression. It is 176 ms; it is not worth
+chasing, but it should not be quietly dropped from the comparison either.
+
+The CPU factor against the local baseline is now **6.5× median** (7.4, 4.2,
+4.5, 8.2, 6.5 across the five stages), down from 15.4× on Free.
+
+---
+
+## openpyxl `write_only`: a measured non-improvement
+
+The .xlsx export is the largest single delay (~4.2 s on Starter, ~3 s of it
+`serialize`), so `write_only` mode was the obvious next step. It was
+implemented, and it does not do what it was expected to do.
+
+A/B on the same 5,000-row offer, same output, five rounds each:
+
+| | Time | Peak Python memory | Bytes out |
+| --- | ---: | ---: | ---: |
+| normal API | 445 ms | 24.2 MB | 293,652 |
+| `write_only` | 455 ms | **1.4 MB** | 293,632 |
+| change | **+2.4%** | **−94.3%** | −20 |
+
+**`write_only` is a memory optimisation, not a speed one.** It avoids holding
+65,000 live `Cell` objects at once; it does not avoid creating or serialising
+them, which is where the time goes.
+
+A profile says exactly that: of ~60,000 cells written, the dominant cost is
+`etree_write_cell` — the per-cell XML writing that both modes share.
+
+The ceiling for any styling-based optimisation, measured by writing the same
+65,000 cells with **no styles at all**:
+
+| | Time |
+| --- | ---: |
+| unstyled floor (same cell count) | 319 ms |
+| current, fully styled | 472 ms |
+
+Styling costs 154 ms, about a third. So even discarding every format — which
+would also discard the text-cell rule that keeps `000101` from opening as
+`101`, and is therefore not on the table — openpyxl still needs 319 ms to
+write 13 columns × 5,000 rows. **This export cannot be made much faster with
+openpyxl.** The real levers are fewer cells or a different writer library
+(`xlsxwriter` is typically 2–4× faster for writing), and neither is worth
+doing without a reason bigger than one export endpoint. **Not taken** — see
+the closing summary.
+
+**Kept anyway, for the memory.** The output is byte-identical in content, all
+34 export tests pass unchanged, and 24.2 MB → 1.4 MB per export matters on a
+512 MB instance if two exports overlap. But it is recorded here as what it is:
+a 2.4% regression in the thing it was meant to improve.
+
+## Worker count: Render was right
+
+Render set `WEB_CONCURRENCY=1` from the instance size, contradicting the two
+workers this document previously recommended. The argument for two was that a
+multi-second export holds the GIL and starves the process. Measured at 0.5
+CPU, with an export running:
+
+| Workers | `/api/health` during an export |
+| --- | ---: |
+| 1 | 74 ms |
+| 2 | 3.4 ms |
+
+Degraded, but 74 ms is nowhere near a health-check timeout — openpyxl releases
+the GIL often enough that it never hard-blocks. Splitting 0.5 vCPU between two
+processes to recover 71 ms is not a good trade. **`WEB_CONCURRENCY` is no
+longer set in `render.yaml`**; Render sizes it, and the app defaults to 1.
+
+## Compression level: 6 is the measured optimum
+
+The Starter table supplies both halves of the trade. Its CPU factor is 6.5×
+local, and its wall-clock gap gives the throughput: the GET's gap is 1065 ms,
+of which 269 ms is the network baseline (from the 127-byte save row) and
+~183 ms is gzip, leaving 613 ms to send 383 kB — about **5.0 Mbps**.
+
+With both numbers, every level can be costed end to end:
+
+| Level | CPU at Starter | Bytes | Time to send | Total | vs level 6 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 84 ms | 598,891 | 958 ms | 1043 ms | +248 ms |
+| 3 | 91 ms | 457,876 | 733 ms | 824 ms | +29 ms |
+| 5 | 162 ms | 401,915 | 643 ms | 806 ms | +11 ms |
+| **6 (current)** | **182 ms** | **383,002** | **613 ms** | **795 ms** | **—** |
+| 9 | 715 ms | 352,683 | 564 ms | 1279 ms | +484 ms |
+
+**Level 6 is the minimum**, and the curve is flat around it — level 5 costs
+11 ms, level 3 costs 29 ms. Level 9 is badly wrong in one direction (CPU) and
+level 1 in the other (bytes). The earlier suspicion that 5 might beat 6 was
+right to raise and wrong on the numbers: it loses by about 11 ms.
+
+**But the level barely matters next to having compression at all:**
+
+| | Bytes | Time |
+| --- | ---: | ---: |
+| No compression | 5,732,959 | ~9173 ms |
+| gzip level 6 | 383,002 | ~795 ms |
+
+Compression costs ~182 ms of CPU and saves **~8.4 seconds and 5.35 MB on every
+offer fetch**, of which there are three per workflow. That is the decision;
+the level is a rounding error against it.
+
+Kept at 6. `compresslevel` is a single argument in `main.py` if a future
+instance changes the balance.
 
 ## Laptop to Neon Ohio — **not representative of deployment**
 
@@ -502,3 +642,71 @@ than argued, and it matches `db_profile.py` exactly.
 It also confirms the bulk insert: the upload writes 5,000 lines across a
 continent in one `executemany`. At 137 ms per statement, 5,000 individual
 INSERTs would have taken **over 11 minutes**.
+
+
+---
+
+# Summary of the performance work
+
+Six measured tables, three code changes, one measured non-improvement, and one
+stopping point.
+
+## Where it ended
+
+| | Free | **Starter** | Local (SQLite) |
+| --- | ---: | ---: | ---: |
+| Whole 5,000-row workflow | 36.7 s | **15.3 s** | 2.0 s |
+| Largest single step | export .xlsx 10.6 s | **export .xlsx 4.2 s** | export .xlsx 0.66 s |
+
+The deployed instance is ~6.5× slower per CPU stage than a laptop, which is
+what a 0.5 vCPU shared instance is. Nothing in the profile is anomalous.
+
+## What actually changed the numbers
+
+| Change | Effect | Measured where |
+| --- | --- | --- |
+| **gzip, level 6** | 5.73 MB → 383 kB per offer fetch; ~8.4 s saved per fetch deployed, at ~182 ms CPU | Local A/B, then costed against the Starter table |
+| **Upload returns a receipt** | Stopped re-reading 5,000 rows it had just written: 6 SQL statements → 4, 2.47 MB read → 344 B, response 5.73 MB → 63 B, upload 737 → 413 ms local | Local A/B + `db_profile.py` |
+| **Server-Timing attribution fix** | No speed change; a database read was being reported as CPU. 2754 ms of a cross-country run was mislabelled | Found on Neon, pinned by a test |
+| **Free → Starter** | 36.7 s → 15.3 s, 2.4×, no code change | Deployed, hardware-verified |
+| **openpyxl `write_only`** | **+2.4% time, −94% memory.** Not the speed win it was meant to be | Local A/B, five rounds each |
+
+## What was measured and deliberately not changed
+
+- **`xlsxwriter` for the export.** openpyxl's floor for 65,000 cells with no
+  styling at all is 319 ms local against 472 ms styled, so the styling we
+  cannot give up — the text-cell rule that keeps `000101` from opening as
+  `101` — is only a third of the cost. A different library is the only real
+  lever left, and a ~4 s export of an internal file does not justify a new
+  dependency.
+- **A lower gzip level.** Costed end to end at every level; 6 is the minimum
+  and the curve is flat around it.
+- **Two uvicorn workers.** A single worker answers `/api/health` in 74 ms
+  during an export. Splitting 0.5 vCPU to recover 71 ms is a bad trade.
+- **Splitting the 5.73 MB offer payload.** The obvious next structural change
+  if offers get much bigger than 5,000 rows, and premature below that.
+
+## The largest remaining delay
+
+**`export .xlsx`, 4179 ms, of which 3055 ms is `serialize`** — openpyxl
+writing 13 columns × 5,000 rows. Next lever: `xlsxwriter`, expected 2–4× on
+that stage, i.e. roughly 3.0 s → 1.0 s and the whole workflow 15.3 s → 13.3 s.
+Not taken, for the reason above.
+
+Second is the **upload at 4129 ms** (parse 1634, db 1491, analyze 272) — the
+irreducible cost of reading a real 5,000-row spreadsheet once, plus writing
+2.47 MB to Postgres.
+
+## Reading these numbers
+
+Three environments appear in this document and they are not interchangeable:
+
+- **Local, SQLite, loopback** — isolates CPU. Finds slow code; says nothing
+  about deployment.
+- **Laptop to Neon Ohio** — measures the 2,000 miles, not the application.
+  Kept only because it exposed the attribution bug and proved the reads are
+  volume-bound rather than round-trip-bound.
+- **Deployed, app and database co-located in Ohio** — the real figure.
+
+Every table states the hardware it ran on, because one that did not cost a
+whole round of analysis when a plan change silently failed to apply.

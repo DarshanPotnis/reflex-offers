@@ -66,14 +66,14 @@ docker run -p 8000:8000 -e DATABASE_URL="sqlite:////tmp/app.db" reflex-offers
 
 ```bash
 cd backend
-python -m pytest -q                    # 177 passed, 6 skipped
+python -m pytest -q                    # 180 passed, 6 skipped
 ```
 
 Against Postgres, where the concurrency tests actually mean something:
 
 ```bash
 TEST_DATABASE_URL='postgresql+psycopg://USER:PASSWORD@HOST/reflex_offers_test' \
-  python -m pytest -q                  # 183 passed
+  python -m pytest -q                  # 186 passed
 ```
 
 The six skips are threaded race tests. SQLite serialises writers, so the
@@ -99,7 +99,7 @@ read from the API, so it cannot pass by agreeing with itself.
 | `FAULT_INJECTION` | unset | `1` enables the `X-Fault` header and the UI test toggle |
 | `PORT` | `8000` | Set by Render |
 | `TEST_DATABASE_URL` | unset | Runs the test suite against Postgres |
-| `WEB_CONCURRENCY` | `1` (Render: `2`) | uvicorn worker processes |
+| `WEB_CONCURRENCY` | `1` (Render sets it from the instance size) | uvicorn worker processes |
 
 If your shell exports a `DATABASE_URL` for another project, unset it for this
 one — `env -u DATABASE_URL uvicorn app.main:app`. A URL the app cannot use (a

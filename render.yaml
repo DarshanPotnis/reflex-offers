@@ -29,10 +29,10 @@ services:
         value: "1"
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: WEB_CONCURRENCY
-        # Two uvicorn workers. Endpoints are sync, so FastAPI runs them in a
-        # threadpool — but openpyxl is pure Python and an 8 s .xlsx export
-        # holds the GIL, starving everything else in that process. A second
-        # worker keeps the health check and other requests answering. Raise
-        # only with more CPU; lower to 1 if memory gets tight.
-        value: "2"
+      # WEB_CONCURRENCY is deliberately NOT set: Render derives it from the
+      # instance size and chose 1 for Starter. Measured at 0.5 CPU, a single
+      # worker answers /api/health in 74 ms while an .xlsx export is running
+      # — degraded from 3 ms, but nowhere near a health-check timeout, and
+      # openpyxl releases the GIL often enough that it never hard-blocks.
+      # Two workers on 0.5 vCPU would split already-scarce CPU for that 71 ms.
+      # The app defaults to 1 when the variable is absent.

@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import io
 from decimal import Decimal
+from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.worksheet import Worksheet
 
 from .evaluate import EvaluatedOffer
 from .export import ExportRecord, export_records
@@ -63,26 +64,6 @@ COLUMN_SPEC: tuple[tuple[str, str, str, int], ...] = (
 MONEY_FORMAT = '"$"#,##0.00##'
 
 
-def _write_text(sheet: Worksheet, row: int, column: int, value: str, *, as_code: bool) -> None:
-    if not value:
-        return
-    cell = sheet.cell(row=row, column=column)
-    cell.value = value
-    # Assigning re-infers the type, so force it back: a description of
-    # '=cmd|...' must be a string, never a formula.
-    cell.data_type = "s"
-    if as_code:
-        cell.number_format = "@"
-
-
-def _write_money(sheet: Worksheet, row: int, column: int, units: int | None) -> None:
-    if units is None:
-        return
-    cell = sheet.cell(row=row, column=column)
-    cell.value = to_decimal(units)  # exact Decimal in, never a float we made
-    cell.number_format = MONEY_FORMAT
-
-
 def _values(record: ExportRecord) -> dict[str, object]:
     return {
         "offer_id": record.offer_id,
@@ -101,45 +82,76 @@ def _values(record: ExportRecord) -> dict[str, object]:
     }
 
 
+def _text_cell(sheet: Any, value: str, *, as_code: bool) -> Any:
+    """A string that stays a string.
+
+    openpyxl infers a leading '=' as a formula, so `data_type` is forced back
+    after construction. `as_code` additionally pins the display format to text,
+    which is what keeps 000101 from opening as 101 and a size of 1/2 from
+    being read as a date.
+    """
+    cell = WriteOnlyCell(sheet, value=value)
+    cell.data_type = "s"
+    if as_code:
+        cell.number_format = "@"
+    return cell
+
+
+def _money_cell(sheet: Any, units: int) -> Any:
+    cell = WriteOnlyCell(sheet, value=to_decimal(units))
+    cell.number_format = MONEY_FORMAT
+    return cell
+
+
 def to_xlsx(offer: EvaluatedOffer, *, offer_id: str, supplier: str | None) -> bytes:
-    """Included lines only, from saved state. No totals row."""
-    workbook = Workbook()
-    sheet = workbook.active
-    assert sheet is not None
-    sheet.title = SHEET_NAME
+    """Included lines only, from saved state. No totals row.
 
-    for index, (_, header, _, width) in enumerate(COLUMN_SPEC, start=1):
-        cell = sheet.cell(row=1, column=index)
-        cell.value = header
-        cell.data_type = "s"
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(vertical="top", wrap_text=True)
+    Written in openpyxl's `write_only` mode: rows are streamed straight to the
+    sheet instead of being held as 5,000 rows of live Cell objects. The normal
+    API spent ~3 s of a deployed request building that object graph.
+    """
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet(SHEET_NAME)
+
+    # Both have to be set before any row is appended.
+    for index, (_, _, _, width) in enumerate(COLUMN_SPEC, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
-
     sheet.freeze_panes = "A2"
 
-    for offset, record in enumerate(
-        export_records(offer, offer_id=offer_id, supplier=supplier), start=2
-    ):
+    bold = Font(bold=True)
+    wrapped = Alignment(vertical="top", wrap_text=True)
+    header_row = []
+    for _, label, _, _ in COLUMN_SPEC:
+        cell = WriteOnlyCell(sheet, value=label)
+        cell.data_type = "s"
+        cell.font = bold
+        cell.alignment = wrapped
+        header_row.append(cell)
+    sheet.append(header_row)
+
+    rows = 1
+    for record in export_records(offer, offer_id=offer_id, supplier=supplier):
         values = _values(record)
-        for index, (field, _, kind, _width) in enumerate(COLUMN_SPEC, start=1):
+        row: list[Any] = []
+        for field, _, kind, _width in COLUMN_SPEC:
             value = values[field]
             if kind == "money":
-                _write_money(sheet, offset, index, value)  # type: ignore[arg-type]
+                row.append(None if value is None else _money_cell(sheet, value))  # type: ignore[arg-type]
             elif kind == "int":
-                sheet.cell(row=offset, column=index).value = value
+                row.append(value)
             else:
-                _write_text(
-                    sheet, offset, index, str(value), as_code=(kind == "code")
+                text = str(value)
+                row.append(
+                    _text_cell(sheet, text, as_code=(kind == "code")) if text else None
                 )
+        sheet.append(row)
+        rows += 1
 
-    sheet.auto_filter.ref = (
-        f"A1:{get_column_letter(len(COLUMN_SPEC))}{max(sheet.max_row, 1)}"
-    )
+    sheet.auto_filter.ref = f"A1:{get_column_letter(len(COLUMN_SPEC))}{rows}"
 
     buffer = io.BytesIO()
     workbook.save(buffer)
-    workbook.close()
+    workbook.close()  # write_only keeps a temp file open until closed
     return buffer.getvalue()
 
 

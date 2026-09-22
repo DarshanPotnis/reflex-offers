@@ -116,3 +116,12 @@ def test_health_reports_the_hardware(client):
     assert body["ok"] is True
     assert "cpu_count" in body and "cpu_limit" in body
     assert "cpu_limit_source" in body and "workers" in body
+
+
+@pytest.mark.parametrize("path", ["/", "/offers/whatever", "/api/health"])
+def test_head_is_allowed_where_get_is(client, path):
+    """Uptime monitors and Render's probes send HEAD. FastAPI does not add it
+    for a GET route the way plain Starlette does, so it is declared."""
+    response = client.head(path)
+    assert response.status_code != 405, f"HEAD {path} was refused"
+    assert response.status_code in (200, 404), response.status_code

@@ -227,11 +227,62 @@ The service is Blueprint-managed, so `render.yaml` — which still said
 `/api/health` reports the container's CPU quota so a future table states its
 own hardware.
 
-> **Render Starter measurement: `<to be filled in>`** — same script, no code
-> change, isolating instance size. Two optimisations are queued behind it and
-> will be measured separately: openpyxl `write_only` mode for the export, and
-> a lower gzip level (which on the Free link measured *net worse*, so it is
-> genuinely open).
+**Deployed — Render Starter + Neon, both in Ohio**, hardware verified by the
+measurement header (`0.5 vCPU · 1 worker`):
+
+| Step | First run | Repeat | vs Free |
+| --- | ---: | ---: | ---: |
+| upload | 4129 ms | 4156 ms | 2.5× |
+| GET offer (review-ready) | 2393 ms | 2417 ms | 2.3× |
+| save one decision | 385 ms | 176 ms | — |
+| export .xlsx | 4179 ms | 4416 ms | 2.5× |
+| **Whole workflow** | **15254 ms** | **15099 ms** | **2.4×** |
+
+**36.7 s → 15.3 s with no code change.** A 5× nominal CPU quota returning 2.4×
+suggests Free was bursting above its nominal 0.1 vCPU, so the Free numbers
+flattered it. The save is the one step that did not improve (124 → 176 ms
+median); it is 7 statements of pure round-trip time to Neon, unrelated to
+instance CPU, and with one sample per configuration that is more likely
+connection warm-up than a regression.
+
+**A 5,000-row offer is review-ready in ~2.4 s and exports in ~4.2 s.**
+
+### What changed the numbers, and what did not
+
+| Change | Effect |
+| --- | --- |
+| gzip level 6 | 5.73 MB → 383 kB per fetch; ~8.4 s saved per fetch deployed for ~182 ms of CPU |
+| Upload returns a receipt | Stopped re-reading 5,000 rows it had just written: 6 SQL statements → 4, 2.47 MB read → 344 B |
+| Server-Timing attribution fix | No speed change — a database read was being reported as CPU |
+| Free → Starter | 2.4×, no code change |
+| openpyxl `write_only` | **+2.4% time, −94% memory** — a memory optimisation, not the speed win intended |
+
+`write_only` is recorded honestly as a non-improvement. It avoids *holding*
+65,000 `Cell` objects, not creating or serialising them, and the per-cell XML
+writing is where the time goes. Kept for the 24 MB → 1.4 MB.
+
+**The compression level was costed end to end** rather than guessed. At the
+Starter instance's 6.5× CPU factor and the ~5.0 Mbps its wall-clock gap
+implies, level 6 is the measured minimum: level 5 costs 11 ms more, level 3
+costs 29 ms, level 9 costs 484 ms. The level is a rounding error next to
+having compression at all.
+
+### Largest remaining delay, and the next lever
+
+**`export .xlsx` at 4179 ms, 3055 ms of it openpyxl** writing 13 columns ×
+5,000 rows. The next lever is **`xlsxwriter`**, typically 2–4× faster for
+writing — roughly 3.0 s → 1.0 s on that stage, and 15.3 s → 13.3 s overall.
+
+**Not taken, deliberately.** openpyxl's floor for the same 65,000 cells with
+*no styling at all* is 319 ms local against 472 ms styled, so the styling we
+cannot give up — the text-cell rule that keeps `000101` from opening as `101` —
+accounts for only a third of the cost. The rest is the library writing cells.
+Replacing it means a second spreadsheet dependency and a re-verification of
+every export guarantee, and **a ~4 s export of an internal file is adequate**.
+It is written down here so the next person starts from the measurement rather
+than from scratch.
+
+Performance work stopped here.
 
 ### Failure and recovery — [docs/failure-demo.md](docs/failure-demo.md)
 
@@ -281,8 +332,10 @@ that becomes uncomfortable, and the fix is a lines-summary/detail split or
 pagination. Not done: the brief's file is 5,000 rows and speculative
 optimisation without a measurement is how systems get complicated.
 
-**`.xlsx` export is the slowest endpoint**, ~446 ms of openpyxl. `write_only`
-mode is the fix when it matters.
+**`.xlsx` export is the slowest endpoint**, ~3.0 s of openpyxl on the deployed
+instance. `write_only` was tried and is a memory fix, not a speed one;
+`xlsxwriter` is the real lever. Measurements and reasoning in
+[docs/speed.md](docs/speed.md).
 
 **A conflict card shows "— total" for an excluded row's line value**, since an
 excluded line genuinely has no line value. It reads slightly oddly in a card
