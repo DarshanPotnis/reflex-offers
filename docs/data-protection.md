@@ -15,7 +15,7 @@ env -u DATABASE_URL DATABASE_URL="sqlite:///$PWD/demo.db" \
 ```bash
 B=http://localhost:8821
 ID=$(curl -s -F "file=@backend/tests/fixtures/01-northstar-line-sheet.xlsx" \
-     $B/api/offers | python -c "import json,sys;print(json.load(sys.stdin)['id'])")
+     $B/api/offers | python -c "import json,sys;print(json.load(sys.stdin)['offer_id'])")
 curl -s $B/api/offers/$ID > before.json
 ```
 
@@ -32,7 +32,7 @@ curl -s -X POST -H 'Content-Type: application/json' \
 ## The attempts, and the real responses
 
 ```
-BEFORE: v1  1733 pieces  $4208.00  sha256=f5f6e5c38406b849
+BEFORE: v1  1733 pieces  $4208.00  sha256=5333a88de0e5e7df
 
 --- negative quantity
     {"line_id":"R9","action":"include","quantity":-5,"unit_cost":"9.00"}
@@ -91,7 +91,7 @@ BEFORE: v1  1733 pieces  $4208.00  sha256=f5f6e5c38406b849
     {"errors":[{"line_id":"R9","messages":["Supplier cost 'abc' isn't an amount we can read. Use a decimal like \"4.50\"."]}]}
     HTTP 422
 
-AFTER:  v1  1733 pieces  $4208.00  sha256=f5f6e5c38406b849
+AFTER:  v1  1733 pieces  $4208.00  sha256=5333a88de0e5e7df
 
 diff before/after:
     (identical — byte for byte)

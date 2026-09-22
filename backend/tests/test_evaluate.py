@@ -641,7 +641,7 @@ def read_summary(data: bytes):
     rows = list(book[SUMMARY_SHEET].iter_rows())
     labels = {row[0].value: row[1] for row in rows if isinstance(row[0].value, str)}
     start = next(
-        (i for i, row in enumerate(rows) if row[0].value == "Why it was left out"), None
+        (i for i, row in enumerate(rows) if row[0].value == "Why it isn't included"), None
     )
     table = [] if start is None else [
         [c.value for c in row] for row in rows[start + 1:] if row[0].value is not None
@@ -678,7 +678,14 @@ def test_summary_sheet_says_what_the_file_is():
     assert to_units(read_amount(
         labels["Retail reference total (not what we pay)"].value
     )) == summary.retail_reference_units
-    assert labels["Lines left out"].value == summary.total_lines - summary.included_lines
+    awaiting = sum(1 for line in offer.lines if line.needs_decision_open)
+    assert labels["Lines left out"].value == (
+        summary.total_lines - summary.included_lines - awaiting
+    )
+    assert labels["Awaiting a decision"].value == awaiting
+    # The screen splits these two the same way, so the numbers can be compared
+    # without reconciling anything.
+    assert labels["Lines left out"].value + awaiting == len(table)
 
     # Every line out of the totals is listed, once, with its reason.
     reasons = {row[1]: row[0] for row in table}
@@ -697,7 +704,10 @@ def test_summary_sheet_totals_equal_the_summary(name):
 
     assert labels["Pieces"].value == summary.pieces
     assert to_units(read_amount(labels["Supplier cost total"].value)) == summary.supplier_cost_units
-    assert labels["Lines left out"].value == len(table) == summary.total_lines - summary.included_lines
+    awaiting = sum(1 for line in offer.lines if line.needs_decision_open)
+    assert labels["Lines left out"].value == len(table) - awaiting
+    assert labels["Awaiting a decision"].value == awaiting
+    assert len(table) == summary.total_lines - summary.included_lines
     if not table:
         assert "None: every line in the sheet is included." in labels
 

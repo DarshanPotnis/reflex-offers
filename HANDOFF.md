@@ -2,7 +2,7 @@
 
 **Live app:** https://reflex-offers.onrender.com
 **Example saved offer:** https://reflex-offers.onrender.com/offers/512c0e68-5d5b-489f-8ad4-fae2bdbc4d8c
-**Submitted commit:** `<to be filled in>`
+**Measured and tested at** `a9ac47d`
 
 Source: this repository. Design and reasoning: [docs/DESIGN.md](docs/DESIGN.md).
 Setup and deploy: [README.md](README.md).
@@ -262,7 +262,32 @@ median); it is 7 statements of pure round-trip time to Neon, unrelated to
 instance CPU, and with one sample per configuration that is more likely
 connection warm-up than a regression.
 
-**A 5,000-row offer is review-ready in ~2.4 s and exports in ~4.2 s.**
+**Submitted version — same hardware, after the final UI pass** (commit
+`a9ac47d`, 3 runs, answer key verified on every run):
+
+| Step | First run | Repeat (median) | Wire | Uncompressed |
+| --- | ---: | ---: | ---: | ---: |
+| upload (parse + store) | 3579 ms | 3404 ms | 63 B | same |
+| GET offer (review-ready) | 1982 ms | 1937 ms | 399 kB (gzip) | 5.88 MB |
+| save one decision | 290 ms | 116 ms | 127 B (gzip) | same |
+| re-fetch after save | 2173 ms | 2199 ms | 399 kB (gzip) | 5.88 MB |
+| export .xlsx | 3983 ms | 4352 ms | 233 kB (gzip) | 277 kB |
+| export .csv | 1255 ms | 1363 ms | 80 kB (gzip) | 647 kB |
+| **Whole workflow** | **13262 ms** | **13370 ms** | | |
+
+**Free 36.7 s → Starter 15.3 s → submitted 13.3 s.** The last step is *not* a
+code win and is not claimed as one: every stage moved together, including ones
+the UI pass cannot touch (upload `parse` 1634 → 1530 ms, `.csv` `serialize`
+240 → 191 ms), while the offer JSON got slightly *bigger*. That is run-to-run
+variance on a shared 0.5 vCPU instance. The stage a real win would show in —
+`.xlsx` `serialize` — barely moved, 3055 → 2992 ms.
+
+Two size changes do come from the final pass: the offer JSON grew 5.73 →
+5.88 MB (383 → 399 kB gzipped) for `would_be_line_value` on every line, and
+the workbook shrank 297 → 277 kB because the offer id no longer repeats on
+5,000 rows — it sits on the Summary sheet instead.
+
+**A 5,000-row offer is review-ready in ~2.0 s and exports in ~4.0 s.**
 
 ### What changed the numbers, and what did not
 
@@ -286,9 +311,10 @@ having compression at all.
 
 ### Largest remaining delay, and the next lever
 
-**`export .xlsx` at 4179 ms, 3055 ms of it openpyxl** writing 13 columns ×
-5,000 rows. The next lever is **`xlsxwriter`**, typically 2–4× faster for
-writing — roughly 3.0 s → 1.0 s on that stage, and 15.3 s → 13.3 s overall.
+**`export .xlsx` at 3983 ms, 2992 ms of it openpyxl** writing 12 columns ×
+5,000 rows plus the Summary sheet. The next lever is **`xlsxwriter`**,
+typically 2–4× faster for writing — roughly 3.0 s → 1.0 s on that stage, and
+13.3 s → about 11.3 s overall.
 
 **Not taken, deliberately.** openpyxl's floor for the same 65,000 cells with
 *no styling at all* is 319 ms local against 472 ms styled, so the styling we
@@ -324,14 +350,14 @@ and the entire offer JSON **byte-identical before and after — same sha256**.
 
 ```
 backend:   193 passed, 6 skipped   (SQLite)
-           178 passed in 594.70s   (Neon Postgres, Phase 4 — the 6 skips run here)
+           199 passed              (Neon Postgres, measured at a9ac47d —
+                                    the 6 skips run here)
 frontend:  107 checks              (real browser, real server)
 ```
 
 The six skips are threaded race tests; SQLite serialises writers so the race
-cannot occur there. The Neon run predates the last 21 tests, which cover the
-export's wording, Summary sheet and would-be value rather than storage or
-concurrency; they have run on SQLite only. The browser check reads its expectations from the API, so
+cannot occur there, so the Postgres run is the one that proves the version
+race and the duplicate-retry path. The browser check reads its expectations from the API, so
 it cannot pass by agreeing with itself.
 
 ---
@@ -345,8 +371,8 @@ link with write access, not a secret.
 **No schema migrations.** Tables are created on startup. Changing a column in
 service would need Alembic.
 
-**Offer payload grows linearly.** The 5,000-row offer is 5.73 MB of JSON
-(383 kB gzipped) and is fetched on load and after each save. At ~20,000 rows
+**Offer payload grows linearly.** The 5,000-row offer is 5.88 MB of JSON
+(399 kB gzipped) and is fetched on load and after each save. At ~20,000 rows
 that becomes uncomfortable, and the fix is a lines-summary/detail split or
 pagination. Not done: the brief's file is 5,000 rows and speculative
 optimisation without a measurement is how systems get complicated.

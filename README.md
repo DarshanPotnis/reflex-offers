@@ -9,6 +9,7 @@ shareable link with a clean export that always matches the screen.
 
 **Live app:** https://reflex-offers.onrender.com
 **Example saved offer:** https://reflex-offers.onrender.com/offers/512c0e68-5d5b-489f-8ad4-fae2bdbc4d8c
+**Measured and tested at** `a9ac47d`
 
 ## What it does
 
@@ -27,8 +28,9 @@ shareable link with a clean export that always matches the screen.
 - **Survives a failed save.** A save that commits but fails to reach the
   browser can be retried without doubling anything, even after a page refresh.
 - **Exports what you see.** `.xlsx` (item code `000101` stays `000101`; a
-  Summary sheet links back to the saved offer and lists every line left out
-  and why) and `.csv`, both built from the same saved state as the screen.
+  Summary sheet links back to the saved offer and lists every line that is
+  not in the file and why) and `.csv`, both built from the same saved state
+  as the screen.
 
 Design and decisions: [docs/DESIGN.md](docs/DESIGN.md) ·
 Handoff: [HANDOFF.md](HANDOFF.md) ·
@@ -67,14 +69,14 @@ docker run -p 8000:8000 -e DATABASE_URL="sqlite:////tmp/app.db" reflex-offers
 
 ```bash
 cd backend
-python -m pytest -q                    # 180 passed, 6 skipped
+python -m pytest -q                    # 193 passed, 6 skipped
 ```
 
 Against Postgres, where the concurrency tests actually mean something:
 
 ```bash
 TEST_DATABASE_URL='postgresql+psycopg://USER:PASSWORD@HOST/reflex_offers_test' \
-  python -m pytest -q                  # 186 passed
+  python -m pytest -q                  # 199 passed (measured at a9ac47d)
 ```
 
 The six skips are threaded race tests. SQLite serialises writers, so the

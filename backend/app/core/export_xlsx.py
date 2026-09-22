@@ -27,8 +27,10 @@ figure can never be mistaken for what we pay.
 
 A **Summary** sheet comes first, so a file forwarded on its own still says
 what it is: the offer link, supplier, source file, the saved version it was
-built from and when, the totals, and every line left out with its reason.
-The offer id lives there rather than repeated down 5,000 rows.
+built from and when, the totals, and every line that is not in the file with
+its reason — counted as "lines left out" and "awaiting a decision" separately,
+the way the screen splits them. The offer id lives there rather than repeated
+down 5,000 rows.
 """
 
 from __future__ import annotations
@@ -74,7 +76,7 @@ COUNT_FORMAT = "#,##0"
 # Summary sheet: labels in A; the left-out table spans A-G beneath them.
 SUMMARY_WIDTHS = (40, 16, 14, 10, 30, 10, 20)
 LEFT_OUT_HEADERS = (
-    "Why it was left out", "Source row", "Item code", "Size", "Description",
+    "Why it isn't included", "Source row", "Item code", "Size", "Description",
     "Pieces", "Supplier cost / piece",
 )
 
@@ -185,9 +187,14 @@ def _write_summary(
         "Retail reference total (not what we pay)",
         _money_cell(sheet, summary.retail_reference_units),
     ])
-    sheet.append(["Lines left out", _count_cell(sheet, len(left_out))])
+    # Split the way the screen splits it: a line left out and a line still
+    # waiting on someone are both absent from the file for different reasons,
+    # and a reviewer comparing the two should not have to reconcile one number.
+    awaiting = sum(1 for line in offer.lines if line.needs_decision_open)
+    sheet.append(["Lines left out", _count_cell(sheet, len(left_out) - awaiting)])
+    sheet.append(["Awaiting a decision", _count_cell(sheet, awaiting)])
     sheet.append([])
-    sheet.append([_bold(sheet, "Lines left out, and why")])
+    sheet.append([_bold(sheet, "Lines not included, and why")])
     if not left_out:
         sheet.append(["None: every line in the sheet is included."])
         return

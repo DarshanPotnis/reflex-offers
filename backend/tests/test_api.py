@@ -664,7 +664,10 @@ def test_workbook_summary_links_back_to_the_saved_offer(client):
     assert to_units(read_amount(labels["Supplier cost total"])) == to_units(
         Decimal(summary["supplier_cost"])
     )
-    assert labels["Lines left out"] == summary["total_lines"] - summary["included_lines"]
+    assert labels["Lines left out"] + labels["Awaiting a decision"] == (
+        summary["total_lines"] - summary["included_lines"]
+    )
+    assert labels["Awaiting a decision"] == summary["needs_decision_open"]
     assert "Offer ID" not in [c.value for c in next(book["Offer"].iter_rows())]
 
 

@@ -23,9 +23,9 @@ is otherwise indistinguishable from one that did nothing.
 Each measured set runs against a server started fresh from the current build,
 so nothing here is stale code.
 
-The full test suite also runs against the real Neon database — `178 passed in
-594.70s`, including the threaded version-race and duplicate-retry tests that
-skip on SQLite. The ten minutes are almost entirely round-trip latency from
+The full test suite also runs against the real Neon database — `199 passed`,
+measured at `a9ac47d`, including the threaded version-race and duplicate-retry
+tests that skip on SQLite. The ten minutes are almost entirely round-trip latency from
 a laptop in Los Angeles to Ohio; see the table at the bottom. Run 1 is a cold process; runs 2–3 are repeats
 into a warm one. Every run uploads a new offer, so parsing is never cached.
 
@@ -496,6 +496,57 @@ The CPU factor against the local baseline is now **6.5× median** (7.4, 4.2,
 
 ---
 
+### Submitted version — Render Starter + Neon, both in Ohio (commit `a9ac47d`)
+
+The measured configuration for the submission, after the final UI pass added
+the Summary sheet, the would-be line value and the nested summary counts.
+
+_host: 0.5 vCPU · host reports 16 cores (cgroup v2) · 1 worker(s) · fault
+injection on · 3 runs · answer key verified on every run_
+
+| Step | First run | Repeat (median) | Wire | Uncompressed | Server-Timing (first run) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| upload (parse + store) | 3579 ms | 3404 ms | 63 B | same | parse 1530, analyze 207, db 1511 |
+| GET offer (review-ready) | 1982 ms | 1937 ms | 399 kB (gzip) | 5.88 MB | db 525, evaluate 398, serialize 176 |
+| save one decision | 290 ms | 116 ms | 127 B (gzip) | same | db 39 |
+| re-fetch after save | 2173 ms | 2199 ms | 399 kB (gzip) | 5.88 MB | db 471, evaluate 447, serialize 398 |
+| export .xlsx | 3983 ms | 4352 ms | 233 kB (gzip) | 277 kB | db 297, evaluate 471, serialize 2992 |
+| export .csv | 1255 ms | 1363 ms | 80 kB (gzip) | 647 kB | db 429, evaluate 484, serialize 191 |
+| **Whole workflow** | **13262 ms** | **13370 ms** | | | |
+
+**Free 36.7 s → Starter 15.3 s → submitted 13.3 s.**
+
+#### What the payload sizes say
+
+| | Starter | Submitted | Why |
+| --- | ---: | ---: | --- |
+| GET offer, uncompressed | 5.73 MB | 5.88 MB | `would_be_line_value` on every line (+2.6%) |
+| GET offer, on the wire | 383 kB | 399 kB | the same field, gzipped |
+| export .xlsx, uncompressed | 297 kB | 277 kB | the offer id column dropped from 5,000 rows, minus the new Summary sheet (−7%) |
+
+Both are consequences of the final pass and both are small. The JSON grew for
+a field that stops the browser multiplying money; the workbook shrank because
+a 36-character offer id no longer repeats on every row.
+
+#### The 2.0 s is not a code win
+
+Every stage improved between the two runs, including stages this change did
+not touch: upload `parse` 1634 → 1530 ms, `.csv` `serialize` 240 → 191 ms,
+`db` on the GET 584 → 525 ms. Nothing in the UI pass can make the parser or a
+Postgres read faster, and the GET payload got *bigger*. The honest reading is
+run-to-run variance on a shared 0.5 vCPU instance, not an optimisation.
+
+The stage that would show a real win is `export .xlsx` `serialize`, and it is
+the one that barely moved: 3055 → 2992 ms (−2%), roughly what dropping one of
+thirteen columns buys. It remains the largest single delay.
+
+This is also why the earlier projection — "`xlsxwriter` would take 15.3 s to
+about 13.3 s" — must not be read as having come true. That projection was
+about the export stage, which is unchanged; the whole-workflow number arrived
+at the same place for an unrelated reason.
+
+---
+
 ## openpyxl `write_only`: a measured non-improvement
 
 The .xlsx export is the largest single delay (~4.2 s on Starter, ~3 s of it
@@ -653,10 +704,13 @@ stopping point.
 
 ## Where it ended
 
-| | Free | **Starter** | Local (SQLite) |
-| --- | ---: | ---: | ---: |
-| Whole 5,000-row workflow | 36.7 s | **15.3 s** | 2.0 s |
-| Largest single step | export .xlsx 10.6 s | **export .xlsx 4.2 s** | export .xlsx 0.66 s |
+| | Free | Starter | **Submitted** | Local (SQLite) |
+| --- | ---: | ---: | ---: | ---: |
+| Whole 5,000-row workflow | 36.7 s | 15.3 s | **13.3 s** | 2.0 s |
+| Largest single step | export .xlsx 10.6 s | export .xlsx 4.2 s | **export .xlsx 4.0 s** | export .xlsx 0.66 s |
+
+The Starter → submitted step is run-to-run variance on a shared instance, not
+a code change; the section above shows why.
 
 The deployed instance is ~6.5× slower per CPU stage than a laptop, which is
 what a 0.5 vCPU shared instance is. Nothing in the profile is anomalous.
@@ -669,6 +723,7 @@ what a 0.5 vCPU shared instance is. Nothing in the profile is anomalous.
 | **Upload returns a receipt** | Stopped re-reading 5,000 rows it had just written: 6 SQL statements → 4, 2.47 MB read → 344 B, response 5.73 MB → 63 B, upload 737 → 413 ms local | Local A/B + `db_profile.py` |
 | **Server-Timing attribution fix** | No speed change; a database read was being reported as CPU. 2754 ms of a cross-country run was mislabelled | Found on Neon, pinned by a test |
 | **Free → Starter** | 36.7 s → 15.3 s, 2.4×, no code change | Deployed, hardware-verified |
+| **Final UI pass** | No speed change to claim: +0.15 MB on the offer JSON, −20 kB on the workbook. The 15.3 → 13.3 s between those runs is instance variance | Deployed, submitted table |
 | **openpyxl `write_only`** | **+2.4% time, −94% memory.** Not the speed win it was meant to be | Local A/B, five rounds each |
 
 ## What was measured and deliberately not changed
@@ -683,17 +738,18 @@ what a 0.5 vCPU shared instance is. Nothing in the profile is anomalous.
   and the curve is flat around it.
 - **Two uvicorn workers.** A single worker answers `/api/health` in 74 ms
   during an export. Splitting 0.5 vCPU to recover 71 ms is a bad trade.
-- **Splitting the 5.73 MB offer payload.** The obvious next structural change
-  if offers get much bigger than 5,000 rows, and premature below that.
+- **Splitting the offer payload**, now 5.88 MB. The obvious next structural
+  change if offers get much bigger than 5,000 rows, and premature below that.
 
 ## The largest remaining delay
 
-**`export .xlsx`, 4179 ms, of which 3055 ms is `serialize`** — openpyxl
-writing 13 columns × 5,000 rows. Next lever: `xlsxwriter`, expected 2–4× on
-that stage, i.e. roughly 3.0 s → 1.0 s and the whole workflow 15.3 s → 13.3 s.
-Not taken, for the reason above.
+**`export .xlsx`, 3983 ms, of which 2992 ms is `serialize`** — openpyxl
+writing 12 columns × 5,000 rows plus the Summary sheet. Next lever:
+`xlsxwriter`, expected 2–4× on that stage, i.e. roughly 3.0 s → 1.0 s, taking
+the whole workflow from 13.3 s to about 11.3 s. Not taken, for the reason
+above.
 
-Second is the **upload at 4129 ms** (parse 1634, db 1491, analyze 272) — the
+Second is the **upload at 3579 ms** (parse 1530, db 1511, analyze 207) — the
 irreducible cost of reading a real 5,000-row spreadsheet once, plus writing
 2.47 MB to Postgres.
 
